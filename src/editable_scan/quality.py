@@ -84,7 +84,7 @@ def _treatments(page):
     return sorted(treatments) or ["preserved"]
 
 
-def _page_report(original, rendered, index, treatments):
+def _page_report(original, rendered, index, treatments, deskew=0, sheet_cropped=False):
     similarity = visual_similarity(original, rendered)
     before, after = analyze_image(original), analyze_image(rendered)
     strength = before["edge_strength"]
@@ -107,12 +107,31 @@ def _page_report(original, rendered, index, treatments):
         )
     else:
         summary = "The source was kept without sharpening or enlargement."
+    if deskew:
+        summary = (
+            f"The page was straightened by {abs(deskew):g} degrees without stretching or cropping. "
+            "Rotation changes pixel positions and can substantially lower similarity. "
+            + (summary if restored else "The original image samples were preserved.")
+        )
+    if sheet_cropped:
+        summary = (
+            "The sheet was isolated from its background and perspective was corrected. "
+            "Cropping and moving the content can substantially lower similarity to the original photo. "
+            + ("Scan edges were also restored. " if restored else "")
+            + (
+                f"Residual tilt was corrected by {abs(deskew):g} degrees."
+                if deskew
+                else ""
+            )
+        )
     return {
         "page": index + 1,
         "similarity_percent": similarity,
         "source_soft": before["soft"],
         "edge_contrast_change_percent": change,
         "treatments": treatments,
+        "deskew_degrees": deskew,
+        "sheet_cropped": sheet_cropped,
         "summary": summary,
     }
 
@@ -141,6 +160,10 @@ def compare_document(source, destination):
                             rendered,
                             index,
                             _treatments(metadata.pages[index]),
+                            float(
+                                metadata.pages[index].obj.get("/EditableScanDeskew", 0)
+                            ),
+                            "/EditableScanSheetCorners" in metadata.pages[index].obj,
                         )
                     )
         else:
@@ -165,6 +188,10 @@ def compare_document(source, destination):
                             rendered,
                             index,
                             _treatments(metadata.pages[index]),
+                            float(
+                                metadata.pages[index].obj.get("/EditableScanDeskew", 0)
+                            ),
+                            "/EditableScanSheetCorners" in metadata.pages[index].obj,
                         )
                     )
     source_bytes, output_bytes = source.stat().st_size, destination.stat().st_size

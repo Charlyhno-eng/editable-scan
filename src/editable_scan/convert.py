@@ -17,6 +17,13 @@ import pikepdf
 import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
+from editable_scan.crop import find_sheet, rectify_sheet
+from editable_scan.deskew import (
+    detect_skew,
+    rotate_ocr,
+    rotation_geometry,
+    straighten_page,
+)
 from editable_scan.enhance import enhance_image, finish_pdf_images, prepare_pdf_images
 from editable_scan.raster import encode_raster, write_raster
 from editable_scan.selection import positioned_text, selection_lines
@@ -154,6 +161,7 @@ def _embed_frame(pdf, frame, width, height, improve, jpeg=None):
     page.Contents = pdf.make_stream(
         f"q {width:.8f} 0 0 {height:.8f} 0 0 cm /Scan Do Q".encode("ascii")
     )
+    return page
 
 
 def _image_pdf(source, results, improve, progress):
@@ -175,11 +183,13 @@ def _image_pdf(source, results, improve, progress):
             frame = ImageOps.exif_transpose(image.copy())
             if frame.mode not in ("1", "L", "LA", "P", "RGB", "RGBA", "CMYK"):
                 frame = frame.convert("RGBA")
+            frame, corners = rectify_sheet(frame) if improve else (frame, None)
             width, height = frame.width * 72 / dx, frame.height * 72 / dy
             # Restoration and compact encoding overlap the OCR inference.
             jpeg = (
                 source.read_bytes()
                 if improve
+                and corners is None
                 and image.format == "JPEG"
                 and image.mode in ("RGB", "L")
                 and image.getexif().get(274, 1) == 1
@@ -192,24 +202,105 @@ def _image_pdf(source, results, improve, progress):
             background = Image.new("RGBA", frame.size, "white")
             background.alpha_composite(ocr_frame)
             gray = background.convert("L")
+            angle = detect_skew(gray) if improve and abs(dx - dy) < 0.01 else 0
+            _, extent = rotation_geometry(*gray.size, angle)
             scale = min(
                 1,
-                OCR_LONG_SIDE / max(gray.size),
-                math.sqrt(RENDER_PIXELS / (gray.width * gray.height)),
+                OCR_LONG_SIDE / max(extent),
+                math.sqrt(RENDER_PIXELS / (extent[0] * extent[1])),
             )
             if scale < 1:
                 gray = gray.resize(
                     (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
                     Image.Resampling.LANCZOS,
                 )
+            if angle:
+                # Resample bounded OCR pixels, never the full-resolution visual scan.
+                _, size = rotation_geometry(*gray.size, angle)
+                gray = rotate_ocr(gray, angle, tuple(math.ceil(v) for v in size))
             results.append(
                 (_recognize(np.asarray(gray), index), gray.width, gray.height)
             )
-            embedded.result()
+            page = embedded.result()
+            straighten_page(page, angle)
+            if corners is not None:
+                page.obj.EditableScanSheetCorners = pikepdf.Array(
+                    [pikepdf.Array(point) for point in corners]
+                )
             progress(index + 1, getattr(image, "n_frames", 1))
         stream = io.BytesIO()
         pdf.save(stream)
         return stream.getvalue()
+
+
+def _rectify_pdf_photo(pdf, target, page, preview):
+    """Rectify a single-photo PDF page without flattening text or vector pages."""
+    objects = list(page.get_objects())
+    if len(objects) != 1 or objects[0].type != pdfium.raw.FPDF_PAGEOBJ_IMAGE:
+        return False
+    corners = find_sheet(preview)
+    if corners is None:
+        return False
+    w, h = page.get_size()
+    px, py = objects[0].get_px_size()
+    scale = min(max(px / w, py / h), math.sqrt(MAX_IMAGE_PIXELS / (w * h)))
+    with closing(page.render(scale=scale)) as bitmap:
+        original = bitmap.to_pil().convert("RGB").copy()
+    corners *= np.array(
+        [original.width / preview.width, original.height / preview.height]
+    )
+    frame, corners = rectify_sheet(original, corners)
+    width, height = frame.width / scale, frame.height / scale
+    replacement = _embed_frame(pdf, frame, width, height, True)
+    target.Resources, target.Contents = replacement.Resources, replacement.Contents
+    target.MediaBox = [0, 0, width, height]
+    target.CropBox = [0, 0, width, height]
+    target.Rotate = 0
+    for name in ("/TrimBox", "/BleedBox", "/ArtBox"):
+        if name in target.obj:
+            del target.obj[name]
+    target.obj.EditableScanSheetCorners = pikepdf.Array(
+        [pikepdf.Array(point) for point in corners]
+    )
+    del pdf.pages[-1]
+    return True
+
+
+def _straighten_pdf(base):
+    """Rectify photos and deskew scans before OCR, keeping digital pages intact."""
+    changed = False
+    with pikepdf.open(io.BytesIO(base)) as pdf, pdfium.PdfDocument(base) as document:
+        for index in range(len(pdf.pages)):
+            target = pdf.pages[index]
+            # Annotation coordinates and interactive destinations must stay valid.
+            if (
+                target.obj.get("/Annots")
+                or target.obj.get("/EditableScanDeskew")
+                or target.obj.get("/EditableScanSheetCorners")
+            ):
+                continue
+            with closing(document[index]) as page:
+                if not any(
+                    page.get_objects(
+                        filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE], max_depth=10
+                    )
+                ):
+                    continue
+                scale = min(100 / 72, 1200 / max(page.get_size()))
+                with closing(page.render(scale=scale)) as bitmap:
+                    preview = bitmap.to_pil().convert("RGB").copy()
+                if _rectify_pdf_photo(pdf, target, page, preview):
+                    changed = True
+                    continue
+                angle = detect_skew(preview)
+            if angle:
+                straighten_page(target, angle)
+                changed = True
+        if changed:
+            stream = io.BytesIO()
+            pdf.save(stream)
+            return stream.getvalue()
+    return base
 
 
 def _unturn(x, y, rotation, width, height):
@@ -287,6 +378,8 @@ def convert_pdf(
         if kind == "image"
         else source.read_bytes()
     )
+    if kind == "pdf" and enhance:
+        base = _straighten_pdf(base)
     with (
         pikepdf.open(io.BytesIO(base)) as output,
         pdfium.PdfDocument(base) as document,
