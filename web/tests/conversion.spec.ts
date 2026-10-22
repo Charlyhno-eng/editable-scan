@@ -14,6 +14,12 @@ test('convert an image, reload the result, and download a PDF', async ({ page })
   await expect(page.getByText('Your PDF is ready')).toBeVisible({ timeout: 45_000 });
   await page.reload();
   await expect(page.getByText('Your PDF is ready')).toBeVisible();
+  await expect(page.getByText('Visual similarity', { exact: true })).toBeVisible();
+  await expect(page.locator('.quality-metrics strong').first()).toHaveText(/\d+\.\d%/);
+  await page.getByText('Comparison details', { exact: true }).click();
+  await expect(page.getByText('Page 1 ·', { exact: false })).toBeVisible();
+  await expect(page.getByText('SSIM on RGB renders', { exact: false })).toBeVisible();
+  await page.screenshot({ path: '/tmp/editable-scan-adaptive-result.png', fullPage: true });
   const downloadEvent = page.waitForEvent('download');
   await page.getByRole('link', { name: 'Download PDF' }).click();
   const download = await downloadEvent;

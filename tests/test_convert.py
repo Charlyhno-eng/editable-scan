@@ -1,8 +1,8 @@
 """Regression checks: original pixels must survive, OCR must stay invisible."""
 
 from contextlib import closing
-from hashlib import sha256
 from functools import partial
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 

@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from editable_scan.convert import DocumentError, _engine, inspect_document, convert_pdf
+from editable_scan.convert import DocumentError, _engine, convert_pdf, inspect_document
 
 log = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -39,6 +39,7 @@ class Job:
     total: int = 0
     error: str | None = None
     finished_at: float | None = None
+    report: dict | None = None
 
 
 class JobStore:
@@ -94,8 +95,11 @@ class JobStore:
                 self.jobs[key].total = total
 
         try:
-            self.converter(folder / "input", folder / "output.pdf", progress)
+            report = {}
+            options = {"report": report} if self.converter is convert_pdf else {}
+            self.converter(folder / "input", folder / "output.pdf", progress, **options)
             with self.lock:
+                self.jobs[key].report = report or None
                 self.jobs[key].status = "done"
         except Exception as exc:
             from indra_ocr import ModelError

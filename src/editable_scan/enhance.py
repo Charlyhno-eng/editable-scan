@@ -2,14 +2,52 @@
 """Deterministic raster restoration without redrawing text or changing layout."""
 
 import math
-import zlib
 
 import cv2
 import numpy as np
 import pikepdf
 from PIL import Image
 
+from editable_scan.raster import encode_raster, write_raster
+
 MAX_ENHANCED_PIXELS = 12_000_000
+
+
+def analyze_image(image):
+    """Estimate scan softness on native pixels, without treating paper as detail."""
+    gray = np.asarray(image.convert("L"))
+    if gray.size > 2_000_000:
+        # A native-resolution central sample avoids making sharp edges look soft.
+        h, w = gray.shape
+        gray = gray[
+            max(0, h // 2 - 600) : h // 2 + 600, max(0, w // 2 - 800) : w // 2 + 800
+        ]
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    gradient = cv2.magnitude(gx, gy)
+    edges = gradient > 100
+    strength = float(gradient[edges].mean()) if edges.any() else 0.0
+    paper = float(np.mean(gray > 235))
+    bilevel = image.mode == "1" or (image.getcolors(2) is not None)
+    document = paper > 0.55 and float(np.mean(gray < 180)) > 0.001
+    if document:
+        # White photographic backgrounds are not sufficient evidence of text.
+        _, _, stats, _ = cv2.connectedComponentsWithStats((gray < 180).astype("uint8"))
+        pieces = stats[1:]
+        small = (
+            (pieces[:, cv2.CC_STAT_AREA] >= 3)
+            & (pieces[:, cv2.CC_STAT_WIDTH] < gray.shape[1] * 0.25)
+            & (pieces[:, cv2.CC_STAT_HEIGHT] < gray.shape[0] * 0.25)
+        )
+        document = bool(np.count_nonzero(small) >= 6)
+    soft = document and strength < 570 and not bilevel
+    return {
+        "document": document,
+        "soft": soft,
+        "edge_strength": strength,
+        "paper_fraction": paper,
+        "bilevel": bilevel,
+    }
 
 
 def _subpixel_ink(image):
@@ -41,7 +79,7 @@ def _subpixel_ink(image):
 
 
 def enhance_image(image):
-    """Reconstruct subpixel edges when available, then upscale and sharpen ink.
+    """Adapt restoration to soft scans; preserve sharp scans and photographs.
 
     The original geometry, color artwork and formula shapes supply the result;
     no generative model invents characters. Transparent and bilevel images are
@@ -60,14 +98,29 @@ def enhance_image(image):
         extrema = [extrema]
     if all(lo == hi for lo, hi in extrema):
         return image
+    analysis = analyze_image(image)
+    subpixel = _subpixel_ink(image) if analysis["document"] else None
+    if (
+        analysis["bilevel"]
+        or not analysis["document"]
+        or not (analysis["soft"] or subpixel is not None)
+    ):
+        image.info["editable_scan_treatment"] = "preserved"
+        return image
+    native_large = max(image.size) >= 2200 or min(image.size) >= 1600
+    requested = (
+        1.0
+        if native_large
+        else (3.0 if subpixel is not None or max(image.size) < 1200 else 2.0)
+    )
     scale = max(
-        1.0, min(3.0, math.sqrt(MAX_ENHANCED_PIXELS / (image.width * image.height)))
+        1.0,
+        min(requested, math.sqrt(MAX_ENHANCED_PIXELS / (image.width * image.height))),
     )
     size = (
         max(image.width, int(image.width * scale)),
         max(image.height, int(image.height * scale)),
     )
-    subpixel = _subpixel_ink(image)
     enlarged = (
         image.resize(size, Image.Resampling.LANCZOS)
         if size != image.size
@@ -86,18 +139,26 @@ def enhance_image(image):
         enlarged = Image.composite(ink, enlarged, mask)
     pixels = np.asarray(enlarged)
     blurred = cv2.GaussianBlur(pixels, (0, 0), max(0.6, scale * 0.35))
-    sharp = cv2.addWeighted(pixels, 2.5, blurred, -1.5, 0)
+    amount = 1.5 if subpixel is not None or analysis["edge_strength"] < 450 else 0.8
+    sharp = cv2.addWeighted(pixels, 1 + amount, blurred, -amount, 0)
     mask = cv2.compare(cv2.absdiff(pixels, blurred), 3, cv2.CMP_GT)
     result = pixels.copy()
     cv2.copyTo(sharp, mask, result)
-    return Image.fromarray(result)
+    restored = Image.fromarray(result)
+    restored.info.update(image.info)
+    restored.info["editable_scan_treatment"] = (
+        "subpixel restoration" if subpixel is not None else "soft-edge restoration"
+    )
+    return restored
 
 
-def _restore_samples(image):
-    restored = enhance_image(image)
-    if restored is image:
-        return None
-    return restored.mode, restored.size, zlib.compress(restored.tobytes(), level=1)
+def _restore_samples(image, already_enhanced=False):
+    restored = image if already_enhanced else enhance_image(image)
+    return (
+        restored.size,
+        encode_raster(restored),
+        restored.info.get("editable_scan_treatment", "preserved"),
+    )
 
 
 def prepare_pdf_images(page, pool):
@@ -131,7 +192,10 @@ def prepare_pdf_images(page, pool):
             and colorspace[1] in (pikepdf.Name.DeviceRGB, pikepdf.Name.DeviceGray)
         )
         if (
-            obj.get("/EditableScanEnhanced", False)
+            (
+                obj.get("/EditableScanEnhanced", False)
+                and obj.get("/EditableScanCompact", False)
+            )
             or obj.objgen in masks
             or obj.get("/ImageMask", False)
             or "/SMask" in obj
@@ -148,7 +212,16 @@ def prepare_pdf_images(page, pool):
         if len(jobs) == 2:
             finish_pdf_images([jobs.pop(0)])
         original = pikepdf.PdfImage(obj).as_pil_image()
-        jobs.append((obj, pool.submit(_restore_samples, original)))
+        jobs.append(
+            (
+                obj,
+                pool.submit(
+                    _restore_samples,
+                    original,
+                    bool(obj.get("/EditableScanEnhanced", False)),
+                ),
+            )
+        )
     return jobs
 
 
@@ -158,14 +231,14 @@ def finish_pdf_images(jobs):
         restored = future.result()
         if restored is None:
             continue
-        mode, size, data = restored
-        obj.write(data, filter=pikepdf.Name.FlateDecode)
-        for key in ("/Decode", "/DecodeParms"):
-            if key in obj:
-                del obj[key]
-        obj.Width, obj.Height = size
-        obj.ColorSpace = (
-            pikepdf.Name.DeviceGray if mode == "L" else pikepdf.Name.DeviceRGB
-        )
-        obj.Interpolate = False
+        size, encoded, treatment = restored
+        # An already compact original JPEG must not become a larger PNG.
+        if treatment == "preserved" and len(encoded[0]) >= len(obj.read_raw_bytes()):
+            obj.EditableScanEnhanced = True
+            obj.EditableScanCompact = True
+            obj.EditableScanTreatment = treatment
+            continue
+        write_raster(obj, encoded, size)
         obj.EditableScanEnhanced = True
+        obj.EditableScanCompact = True
+        obj.EditableScanTreatment = treatment

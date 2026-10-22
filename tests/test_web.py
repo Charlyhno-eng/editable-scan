@@ -6,12 +6,15 @@ from __future__ import annotations
 import io
 import threading
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pikepdf
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from editable_scan import convert as conversion
 from editable_scan import web
 from editable_scan.convert import DocumentError
 
@@ -170,3 +173,27 @@ def test_models_warm_up_on_the_same_worker_as_conversions(monkeypatch):
             timeout=3
         )
         assert loaded_on == [worker]
+
+
+def test_completed_job_keeps_visual_report_after_source_cleanup(monkeypatch):
+    monkeypatch.setattr(web, "_engine", lambda: None)
+    monkeypatch.setattr(
+        conversion,
+        "_engine",
+        lambda: lambda _: SimpleNamespace(source="ocr", rotation=0, lines=[]),
+    )
+    fixture = Path(__file__).parent / "fixtures" / "scan.png"
+    app = web.create_app()
+    with TestClient(app) as client:
+        key = client.post(
+            "/api/jobs", files={"file": ("scan.png", fixture.read_bytes())}
+        ).json()["id"]
+        job = await_job(client, key)
+        assert job["status"] == "done"
+        report = job["report"]
+        assert 0 <= report["similarity_percent"] <= 100
+        assert len(report["pages"]) == 1
+        download = client.get(f"/api/jobs/{key}/download")
+        assert report["output_bytes"] == len(download.content)
+        assert not (app.state.store.root / key / "input").exists()
+        assert client.get(f"/api/jobs/{key}").json()["report"] == report

@@ -55,6 +55,15 @@ h2 { font-size: 17px; font-weight: 500; margin: 0 0 9px; letter-spacing: -.3px; 
 .failure { color: #f2b0b7; background: #38262f; border-color: #623b4a; font-size: 24px; }
 .filename { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; margin: 3px 0 0; color: #a0adc4; }
 .result-caption { font-size: 12px; color: #8192ac; margin: 13px 0 28px; }
+.quality-report { width: 100%; margin-top: 28px; border-top: 1px solid #29374e; padding-top: 23px; }
+.quality-metrics { display: flex; justify-content: center; gap: 48px; }
+.quality-metrics div { display: flex; flex-direction: column; gap: 7px; }
+.quality-metrics strong { color: #c3d6f6; font-size: 23px; font-weight: 500; }
+.quality-metrics span, .quality-note { color: #94a5be; font-size: 11px; }
+.quality-note { line-height: 1.6; margin: 18px 0 12px; }
+.quality-report details { text-align: left; font-size: 12px; color: #a1b2cd; line-height: 1.65; }
+.quality-report summary { cursor: pointer; text-align: center; color: #b8cbed; }
+.quality-report details p { overflow-wrap: anywhere; }
 .text-link { display: inline-block; font-size: 12px; color: #a4b2c9; margin-top: 28px; padding: 6px; }
 .text-link:hover { color: #d9e7ff; }
 .secondary { border-color: #405374; color: #b5c9ee; background: #1a2942; }

@@ -7,7 +7,6 @@ import io
 import math
 import os
 import threading
-import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -19,6 +18,8 @@ import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
 from editable_scan.enhance import enhance_image, finish_pdf_images, prepare_pdf_images
+from editable_scan.raster import encode_raster, write_raster
+from editable_scan.selection import positioned_text, selection_lines
 from editable_scan.text import TextLayer
 
 MAX_PAGES = 200
@@ -91,38 +92,38 @@ def _recognize(gray, index):
     result = _engine()(gray)
     if result.source == "error":
         raise DocumentError(f"Unable to recognize page {index + 1}.")
+    result.selection = selection_lines(result, gray)
     return result
 
 
-def _embed_frame(pdf, frame, width, height, improve):
+def _embed_frame(pdf, frame, width, height, improve, jpeg=None):
+    original_frame = frame
     if improve:
         frame = enhance_image(frame)
-    if frame.mode == "1":
-        frame = frame.convert("L")
-    elif frame.mode not in ("RGB", "L", "CMYK", "RGBA"):
+    if frame.mode not in ("1", "RGB", "L", "CMYK", "RGBA"):
         frame = frame.convert("RGBA")
     alpha = frame.getchannel("A") if frame.mode == "RGBA" else None
     if alpha is not None:
         frame = frame.convert("RGB")
 
     def raster(image, colorspace):
-        obj = pdf.make_stream(zlib.compress(image.tobytes(), level=1))
-        obj.Type = pikepdf.Name.XObject
-        obj.Subtype = pikepdf.Name.Image
-        obj.Width, obj.Height = image.size
-        obj.BitsPerComponent = 8
-        obj.ColorSpace = colorspace
-        obj.Filter = pikepdf.Name.FlateDecode
-        obj.Interpolate = False
+        obj = pdf.make_stream(b"")
+        encoded = encode_raster(image, compact=improve and alpha is None)
+        # Indexed/grayscale optimizations provide their own device color space.
+        override = colorspace if isinstance(colorspace, pikepdf.Array) else None
+        write_raster(obj, encoded, image.size, colorspace=override)
         return obj
 
     colorspace = {
+        "1": pikepdf.Name.DeviceGray,
         "L": pikepdf.Name.DeviceGray,
         "RGB": pikepdf.Name.DeviceRGB,
         "CMYK": pikepdf.Name.DeviceCMYK,
     }[frame.mode]
     profile = frame.info.get("icc_profile", b"")
-    signature = {"L": b"GRAY", "RGB": b"RGB ", "CMYK": b"CMYK"}[frame.mode]
+    signature = {"1": b"GRAY", "L": b"GRAY", "RGB": b"RGB ", "CMYK": b"CMYK"}[
+        frame.mode
+    ]
     if (
         len(profile) >= 128
         and profile[36:40] == b"acsp"
@@ -132,8 +133,20 @@ def _embed_frame(pdf, frame, width, height, improve):
         icc.N = len(frame.getbands())
         icc.Alternate = colorspace
         colorspace = pikepdf.Array([pikepdf.Name.ICCBased, icc])
-    obj = raster(frame, colorspace)
+    if jpeg is not None and frame is original_frame:
+        # Reuse a photograph's original JPEG without decoding/re-encoding losses.
+        obj = pdf.make_stream(b"")
+        write_raster(
+            obj,
+            (jpeg, pikepdf.Name.DCTDecode, None, frame.mode, 8, None),
+            frame.size,
+            colorspace=colorspace,
+        )
+    else:
+        obj = raster(frame, colorspace)
     obj.EditableScanEnhanced = bool(improve)
+    obj.EditableScanCompact = bool(improve)
+    obj.EditableScanTreatment = frame.info.get("editable_scan_treatment", "preserved")
     if alpha is not None and alpha.getextrema() != (255, 255):
         obj.SMask = raster(alpha, pikepdf.Name.DeviceGray)
     page = pdf.add_blank_page(page_size=(width, height))
@@ -163,8 +176,18 @@ def _image_pdf(source, results, improve, progress):
             if frame.mode not in ("1", "L", "LA", "P", "RGB", "RGBA", "CMYK"):
                 frame = frame.convert("RGBA")
             width, height = frame.width * 72 / dx, frame.height * 72 / dy
-            # Restoration and lossless encoding overlap the OCR inference.
-            embedded = pool.submit(_embed_frame, pdf, frame, width, height, improve)
+            # Restoration and compact encoding overlap the OCR inference.
+            jpeg = (
+                source.read_bytes()
+                if improve
+                and image.format == "JPEG"
+                and image.mode in ("RGB", "L")
+                and image.getexif().get(274, 1) == 1
+                else None
+            )
+            embedded = pool.submit(
+                _embed_frame, pdf, frame, width, height, improve, jpeg
+            )
             ocr_frame = frame.convert("RGBA")
             background = Image.new("RGBA", frame.size, "white")
             background.alpha_composite(ocr_frame)
@@ -216,7 +239,7 @@ def _overlay(target, result, width, height, existing, text_layer):
         (height, width) if rotation % 180 else (width, height)
     )
     commands = []
-    for line in result.lines:
+    for line in getattr(result, "selection", result.lines):
         text = line.text.strip()
         if not text:
             continue
@@ -232,13 +255,12 @@ def _overlay(target, result, width, height, existing, text_layer):
         box = (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
         if _covered(box, existing):
             continue
-        encoded = text_layer.encode(text)
-        advance = (x1 - x0) / len(text)
+        advance, content = positioned_text(line, text_layer, (x0, y0, x1, y1))
         line_height = y1 - y0
         baseline = upright_height - y1 + 0.2 * line_height
         commands.append(
             f"BT /OCR 1 Tf 3 Tr {advance:.6f} 0 0 {line_height:.6f} "
-            f"{x0:.6f} {baseline:.6f} Tm <{encoded}> Tj ET"
+            f"{x0:.6f} {baseline:.6f} Tm {content} ET"
         )
     if commands:
         text_layer.overlay(target, commands, upright_width, upright_height, rotation)
@@ -250,6 +272,7 @@ def convert_pdf(
     progress: Callable[[int, int], None] = lambda _done, _total: None,
     *,
     enhance: bool = True,
+    report: dict | None = None,
 ) -> int:
     """Restore raster detail while keeping layout, vectors and existing text.
 
@@ -326,5 +349,9 @@ def convert_pdf(
         for obj in output.objects:
             if isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == "/Image":
                 obj.Interpolate = False
-        output.save(destination)
+        output.save(destination, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+    if report is not None:
+        from editable_scan.quality import compare_document
+
+        report.update(compare_document(source, destination))
     return count

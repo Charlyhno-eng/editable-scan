@@ -10,7 +10,31 @@ type Job = {
   done: number;
   total: number;
   error: string | null;
+  report?: {
+    similarity_percent: number;
+    method: string;
+    source_bytes: number;
+    output_bytes: number;
+    size_reduction_percent: number;
+    pages: { page: number; similarity_percent: number; summary: string }[];
+  } | null;
 };
+
+function fileSize(bytes: number) {
+  return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(0)} KB` : `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function QualityReport({ report }: { report: NonNullable<Job['report']> }) {
+  return <div className="quality-report">
+    <div className="quality-metrics"><div><strong>{report.similarity_percent.toFixed(1)}%</strong><span>Visual similarity</span></div><div><strong>{fileSize(report.output_bytes)}</strong><span>PDF size</span></div></div>
+    <p className="quality-note">Compared with the source. Similarity measures appearance, not text accuracy.</p>
+    <details><summary>Comparison details</summary>
+      <p>Source: {fileSize(report.source_bytes)} · PDF: {fileSize(report.output_bytes)}{report.size_reduction_percent > 0 ? ` · ${report.size_reduction_percent}% smaller` : ''}</p>
+      {report.pages.map(page => <p key={page.page}><b>Page {page.page} · {page.similarity_percent.toFixed(1)}%</b><br />{page.summary}</p>)}
+      <p>{report.method}</p>
+    </details>
+  </div>;
+}
 
 function Icon({ name, className = '' }: { name: 'upload' | 'file' | 'download' | 'check' | 'arrow' | 'text'; className?: string }) {
   const paths = {
@@ -121,9 +145,9 @@ function Document() {
     <div className="intro compact"><span className="eyebrow">FROM SCAN TO TEXT</span><h1>{done ? <>Your document, <span>ready.</span></> : failed ? 'Something went wrong.' : <>Your text <span>is taking shape.</span></>}</h1></div>
     <section className="panel result" aria-live="polite" aria-busy={!done && !failed}>
       <div className={`result-icon ${done ? 'success' : failed ? 'failure' : 'processing'}`}>{done ? <Icon name="check" /> : failed ? <span>!</span> : <Icon name="text" />}</div>
-      <h2>{done ? 'Your PDF is ready' : failed ? 'Conversion interrupted' : job?.status === 'queued' ? 'Waiting in queue…' : 'Recognizing text…'}</h2>
+      <h2>{done ? 'Your PDF is ready' : failed ? 'Conversion interrupted' : job?.status === 'queued' ? 'Waiting in queue…' : job?.done && job.done === job.total ? 'Comparing visual quality…' : 'Recognizing text…'}</h2>
       {job && <p className="filename" title={job.filename}>{job.filename}</p>}
-      {failed ? <><p className="error" role="alert">{error || job?.error}</p>{error && <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}</> : done ? <><p className="result-caption">{job.total} {job.total > 1 ? 'pages' : 'page'} · Selectable text</p><a className="button primary" href={`/api/jobs/${id}/download`} download><Icon name="download" /> Download PDF</a></> : <div className="progress-area"><div className={`progress-track ${!job?.done ? 'indeterminate' : ''}`} role="progressbar" aria-label="Pages processed" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job?.done ? progress : undefined}><span style={{ width: `${progress}%` }} /></div><p>{job?.done ? `${job.done} / ${job.total} pages` : 'Preparing document'}</p></div>}
+      {failed ? <><p className="error" role="alert">{error || job?.error}</p>{error && <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}</> : done ? <><p className="result-caption">{job.total} {job.total > 1 ? 'pages' : 'page'} · Selectable text</p><a className="button primary" href={`/api/jobs/${id}/download`} download><Icon name="download" /> Download PDF</a>{job.report && <QualityReport report={job.report} />}</> : <div className="progress-area"><div className={`progress-track ${!job?.done ? 'indeterminate' : ''}`} role="progressbar" aria-label="Pages processed" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job?.done ? progress : undefined}><span style={{ width: `${progress}%` }} /></div><p>{job?.done ? `${job.done} / ${job.total} pages` : 'Preparing document'}</p></div>}
     </section>
     <Link className="text-link" to="/">{done || failed ? 'Convert another file' : 'Back to home'}</Link>
   </>;

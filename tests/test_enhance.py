@@ -1,15 +1,15 @@
 """Restoration quality, layout, Unicode and useful concurrency checks."""
 
+import threading
 from contextlib import closing
 from pathlib import Path
-import threading
 from types import SimpleNamespace
 
 import numpy as np
 import pikepdf
 import pypdfium2 as pdfium
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from fpdf import FPDF
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from editable_scan import convert
 from editable_scan import enhance as restoration
@@ -194,7 +194,8 @@ def test_indexed_pdf_scan_is_enhanced_and_visible_text_stays_vector(
     convert.convert_pdf(source, output)
     with pikepdf.open(output) as result:
         raster = raster_objects(result)[0]
-        assert int(raster.Width) == image.width * 3
+        # Already sharp indexed scans should no longer be enlarged.
+        assert int(raster.Width) == image.width
         assert result.docinfo.Title == "Preserved metadata"
     assert "Keep this vector text" in extracted(output)
     # At 400%, the digital caption must have exactly the same rendered pixels.
