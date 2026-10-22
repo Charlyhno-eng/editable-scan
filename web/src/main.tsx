@@ -1,6 +1,7 @@
 import { StrictMode, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Link, Route, Routes, useNavigate, useParams } from 'react-router';
+import logo from '../../assets/editable-scan-logo.png';
 import './style.css';
 
 type Job = {
@@ -158,7 +159,7 @@ function NotFound() {
 }
 
 function App() {
-  return <div className="app"><header><Link className="brand" to="/" aria-label="Editable Scan — home"><span className="brand-icon"><Icon name="text" /></span>editable<span className="brand-light">scan</span></Link><span className="local-label"><i /> Local processing</span></header><main><Routes><Route path="/" element={<Upload />} /><Route path="/document/:id" element={<Document />} /><Route path="*" element={<NotFound />} /></Routes></main><footer><span>Figures and layout preserved.</span><span>Editable Scan</span></footer></div>;
+  return <div className="app"><header><Link className="brand" to="/" aria-label="Editable Scan — home"><img className="brand-icon" src={logo} alt="" width="40" height="36" />editable<span className="brand-light">scan</span></Link><span className="local-label"><i /> Local processing</span></header><main><Routes><Route path="/" element={<Upload />} /><Route path="/document/:id" element={<Document />} /><Route path="*" element={<NotFound />} /></Routes></main><footer><span>Figures and layout preserved.</span><span>Editable Scan</span></footer></div>;
 }
 
 createRoot(document.getElementById('root')!).render(<StrictMode><BrowserRouter><App /></BrowserRouter></StrictMode>);

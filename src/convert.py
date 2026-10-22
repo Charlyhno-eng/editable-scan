@@ -17,17 +17,17 @@ import pikepdf
 import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
-from editable_scan.crop import find_sheet, rectify_sheet
-from editable_scan.deskew import (
+from src.crop import find_sheet, rectify_sheet
+from src.deskew import (
     detect_skew,
     rotate_ocr,
     rotation_geometry,
     straighten_page,
 )
-from editable_scan.enhance import enhance_image, finish_pdf_images, prepare_pdf_images
-from editable_scan.raster import encode_raster, write_raster
-from editable_scan.selection import positioned_text, selection_lines
-from editable_scan.text import TextLayer
+from src.enhance import enhance_image, finish_pdf_images, prepare_pdf_images
+from src.raster import encode_raster, write_raster
+from src.selection import positioned_text, selection_lines
+from src.text import TextLayer
 
 MAX_PAGES = 200
 MAX_IMAGE_PIXELS = 40_000_000
@@ -444,7 +444,7 @@ def convert_pdf(
                 obj.Interpolate = False
         output.save(destination, object_stream_mode=pikepdf.ObjectStreamMode.generate)
     if report is not None:
-        from editable_scan.quality import compare_document
+        from src.quality import compare_document
 
         report.update(compare_document(source, destination))
     return count

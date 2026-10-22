@@ -14,9 +14,9 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from editable_scan import convert as conversion
-from editable_scan import web
-from editable_scan.convert import DocumentError
+from src import convert as conversion
+from src import web
+from src.convert import DocumentError
 
 
 def image_bytes():

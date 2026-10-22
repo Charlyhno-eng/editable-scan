@@ -8,7 +8,7 @@ import numpy as np
 import pikepdf
 from PIL import Image
 
-from editable_scan.raster import encode_raster, write_raster
+from src.raster import encode_raster, write_raster
 
 MAX_ENHANCED_PIXELS = 12_000_000
 

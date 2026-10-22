@@ -10,8 +10,8 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from editable_scan import convert
-from editable_scan.crop import _rectified_size, find_sheet, rectify_sheet
+from src import convert
+from src.crop import _rectified_size, find_sheet, rectify_sheet
 
 
 def paper(frame=False):

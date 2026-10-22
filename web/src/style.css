@@ -11,8 +11,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .app::before { content: ''; position: absolute; z-index: -1; top: 7%; left: 50%; transform: translateX(-50%); width: min(1000px, 140vw); height: 730px; background: radial-gradient(ellipse at center, #263d692a 0, transparent 68%); pointer-events: none; }
 header { width: 100%; max-width: 1400px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; height: 112px; gap: 20px; }
 .brand { display: flex; align-items: center; font-weight: 650; font-size: 21px; letter-spacing: -.9px; }
-.brand-icon { display: grid; place-items: center; width: 34px; height: 36px; margin-right: 10px; border-radius: 10px; background: #19263e; color: #a8c3ff; border: 1px solid #2b3e5d; }
-.brand-icon svg { width: 21px; }
+.brand-icon { display: block; width: 40px; height: 36px; margin-right: 10px; object-fit: contain; }
 .brand-light { color: #8e9ab1; font-weight: 400; }
 .local-label { display: flex; gap: 9px; align-items: center; font-size: 12px; color: #98a6bd; }
 .local-label i { width: 5px; height: 5px; border-radius: 50%; background: #8ea8c7; box-shadow: 0 0 0 4px #8ea8c70a; }

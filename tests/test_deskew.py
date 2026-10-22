@@ -9,8 +9,8 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from editable_scan import convert
-from editable_scan.deskew import detect_skew, rotation_geometry
+from src import convert
+from src.deskew import detect_skew, rotation_geometry
 
 
 def document():

@@ -13,7 +13,7 @@ import pytest
 from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageOps
 
-from editable_scan import convert
+from src import convert
 
 FIXTURES = Path(__file__).parent / "fixtures"
 convert_original = partial(convert.convert_pdf, enhance=False)

@@ -22,10 +22,13 @@ dependencies = [
 ]
 
 [project.scripts]
-editable-scan = "editable_scan.web:run"
+editable-scan = "src.web:run"
 
 [dependency-groups]
 test = ["fpdf2>=2.8.9", "httpx>=0.28", "pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

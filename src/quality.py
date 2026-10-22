@@ -10,7 +10,7 @@ import pikepdf
 import pypdfium2 as pdfium
 from PIL import Image, ImageOps
 
-from editable_scan.enhance import analyze_image
+from src.enhance import analyze_image
 
 ANALYSIS_LONG_SIDE = 1600
 METHOD = (

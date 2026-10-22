@@ -10,11 +10,11 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from editable_scan import convert
-from editable_scan.enhance import analyze_image, enhance_image
-from editable_scan.quality import compare_document, visual_similarity
-from editable_scan.raster import encode_raster, write_raster
-from editable_scan.selection import readable_text, word_boxes
+from src import convert
+from src.enhance import analyze_image, enhance_image
+from src.quality import compare_document, visual_similarity
+from src.raster import encode_raster, write_raster
+from src.selection import readable_text, word_boxes
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from editable_scan.convert import DocumentError, _engine, convert_pdf, inspect_document
+from src.convert import DocumentError, _engine, convert_pdf, inspect_document
 
 log = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -247,7 +247,7 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
     directory = static_dir or Path(
         os.environ.get(
             "EDITABLE_SCAN_WEB_DIR",
-            Path(__file__).resolve().parents[2] / "web" / "dist",
+            Path(__file__).resolve().parents[1] / "web" / "dist",
         )
     )
     if (directory / "index.html").is_file():

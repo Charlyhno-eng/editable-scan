@@ -11,8 +11,8 @@ import pypdfium2 as pdfium
 from fpdf import FPDF
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from editable_scan import convert
-from editable_scan import enhance as restoration
+from src import convert
+from src import enhance as restoration
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

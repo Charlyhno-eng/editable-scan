@@ -11,7 +11,7 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: '../.venv/bin/python -m editable_scan.web',
+    command: 'cd .. && .venv/bin/python -m src.web',
     url: 'http://127.0.0.1:8123/api/health',
     env: { PORT: '8123' },
     reuseExistingServer: false,
