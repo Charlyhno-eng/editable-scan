@@ -88,3 +88,43 @@ test('report editor expiry clearly', async ({ page }) => {
   await expect(page.getByRole('link', { name: 'Return to document' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Download PDF' })).toBeDisabled();
 });
+
+test('serve PDF.js resources at the URLs requested by its worker', async ({ request }) => {
+  const resources = [
+    '/pdfjs/wasm/qcms_bg.wasm',
+    '/pdfjs/wasm/openjpeg.wasm',
+    '/pdfjs/wasm/jbig2.wasm',
+    '/pdfjs/iccs/CGATS001Compat-v2-micro.icc',
+    '/pdfjs/standard_fonts/LiberationSans-Regular.ttf',
+    '/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap',
+  ];
+  for (const url of resources) {
+    const response = await request.get(url);
+    expect(response.status(), url).toBe(200);
+    expect(response.headers()['content-type'], url).not.toContain('text/html');
+    const body = await response.body();
+    expect(body.length, url).toBeGreaterThan(100);
+    if (url.endsWith('.wasm')) expect([...body.subarray(0, 4)]).toEqual([0, 97, 115, 109]);
+  }
+});
+
+test('save long replacements, preview continuation pages and undo without 422 errors', async ({ page }) => {
+  const failures: string[] = [];
+  page.on('response', response => { if (response.url().includes('/api/') && response.status() >= 400) failures.push(`${response.status()} ${response.url()}`); });
+  await openEditor(page);
+  await page.getByRole('button', { name: /Edit original text: Bonjour/ }).click();
+  const replacement = 'A longer replacement keeps the original text size. '.repeat(60).trim();
+  await page.getByRole('textbox', { name: 'Text content' }).fill(replacement);
+  await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Next page' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Next page' }).click();
+  await expect(page.locator('.editor-paper')).toHaveAttribute('data-ready', 'true');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Previous page' }).click();
+  await page.getByRole('button', { name: /Edit original text: Bonjour/ }).click();
+  await expect(page.getByRole('textbox', { name: 'Text content' })).toHaveValue(replacement);
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled();
+  await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible();
+  expect(failures).toEqual([]);
+});

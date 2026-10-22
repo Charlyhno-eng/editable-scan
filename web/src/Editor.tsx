@@ -95,6 +95,9 @@ export default function Editor() {
   const latest = useRef({ loaded, json });
   latest.current = { loaded, json };
   const editedIds = new Set(edits.map(item => item.id));
+  const pageCount = (preview || original)?.numPages || 1;
+
+  useEffect(() => { setPage(value => Math.min(value, pageCount)); }, [pageCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -127,13 +130,14 @@ export default function Editor() {
     if (!loaded) return;
     const controller = new AbortController();
     setLoadingPassages(true); setPassages([]); setSelected(null);
+    if (original && page > original.numPages) { setLoadingPassages(false); return; }
     void fetch(`/api/jobs/${id}/passages?page=${page}`, { signal: controller.signal, cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error(await errorMessage(response));
       const result: Passage[] = await response.json();
       if (!controller.signal.aborted) { setPassages(result); setLoadingPassages(false); }
     }).catch(cause => { if (!controller.signal.aborted) { setError(cause.message); setLoadingPassages(false); } });
     return () => controller.abort();
-  }, [id, loaded, page]);
+  }, [id, loaded, page, original]);
 
   const save = useCallback((body: string) => {
     const request = saveQueue.current.catch(() => {}).then(async () => {
@@ -234,15 +238,15 @@ export default function Editor() {
         <span className="save-status" role="status">{previewing ? 'Updating preview…' : saveStatus}</span>
       </div>
       <div className="editor-layout"><div className="preview-column">
-        <div className="page-controls"><button className="tool-button" aria-label="Previous page" disabled={page === 1} onClick={() => setPage(page-1)}>←</button><span>Page {page} / {original!.numPages}</span><button className="tool-button" aria-label="Next page" disabled={page === original!.numPages} onClick={() => setPage(page+1)}>→</button></div>
-        <PagePreview pdf={preview || original!} page={page} zoom={zoom} passages={passages} selected={selected} edited={editedIds} onSelect={setSelected} onError={setError} />
+        <div className="page-controls"><button className="tool-button" aria-label="Previous page" disabled={page === 1} onClick={() => setPage(page-1)}>←</button><span>Page {page} / {pageCount}</span><button className="tool-button" aria-label="Next page" disabled={page >= pageCount} onClick={() => setPage(page+1)}>→</button></div>
+        <PagePreview pdf={preview || original!} page={Math.min(page, pageCount)} zoom={zoom} passages={passages} selected={selected} edited={editedIds} onSelect={setSelected} onError={setError} />
         <p className="editor-hint">Click an existing line to edit its text, weight or color.</p>
       </div><aside className="text-properties" aria-label="Text properties">
         <div className="properties-title"><h2>{current ? 'Original text' : 'Select text'}</h2>{current && editedIds.has(current.id) && <button className="tool-button" onClick={() => commit(items => items.filter(item => item.id !== current.id))}>Restore original</button>}</div>
-        {current ? <><label className="field-label">Text<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} /><span>Keep the text within its original line.</span></label>
+        {current ? <><label className="field-label">Text<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} /><span>Text keeps its size and wraps into free space. Overflow continues on an extra page.</span></label>
           <div className="format-controls"><button className={`tool-button format-bold ${current.bold ? 'active' : ''}`} aria-label="Bold" aria-pressed={current.bold} onClick={() => patch({ bold: !current.bold })}>B</button><label className="field-label color-field">Color<input type="color" aria-label="Text color" value={current.color} onChange={event => patch({ color: event.target.value }, `${selected}:color`)} /></label></div>
           <p className="properties-note">{source!.scanned ? 'Bold and color preserve the scanned letter shapes. Rewritten words use an automatically matched font; an exact match cannot be guaranteed from an image.' : `Original font: ${source!.font}. Embedded glyphs are reused when available; unavailable glyphs use a matching fallback.`}</p>
-        </> : <p className="properties-note">{loadingPassages ? 'Finding original text…' : passages.length ? 'Choose a line on the page or below.' : 'No editable horizontal text was recognized on this page.'}</p>}
+        </> : <p className="properties-note">{page > original!.numPages ? 'Continuation page. Return to the original page to edit this text.' : loadingPassages ? 'Finding original text…' : passages.length ? 'Choose a line on the page or below.' : 'No editable horizontal text was recognized on this page.'}</p>}
         {passages.length > 0 && <div className="text-box-list"><span className="field-label">Original text on this page</span>{passages.map(item => <button key={item.id} className={`text-box-entry ${selected === item.id ? 'active' : ''}`} onClick={() => setSelected(item.id)}>{edits.find(edit => edit.id === item.id)?.text ?? item.text}</button>)}</div>}
       </aside></div>
       <p className="draft-note">Drafts expire after one hour of inactivity. Download your PDF to keep your changes.</p>

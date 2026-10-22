@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 export default defineConfig({
   plugins: [react(), viteStaticCopy({ targets: ['cmaps', 'standard_fonts', 'wasm', 'iccs'].map(directory => ({
-    src: fileURLToPath(new URL(`./node_modules/pdfjs-dist/${directory}`, import.meta.url)), dest: 'pdfjs',
+    src: fileURLToPath(new URL(`./node_modules/pdfjs-dist/${directory}/*`, import.meta.url)),
+    dest: `pdfjs/${directory}`, rename: { stripBase: true },
   })) })],
   server: { proxy: { '/api': 'http://127.0.0.1:8000' } },
 });

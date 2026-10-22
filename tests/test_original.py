@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from src.convert import _overlay
 from src.editor import FONTS, EditError, EditorDraft, OriginalEdit, export_pdf
-from src.original import original_regions
+from src.original import display_matrix, original_regions
 from src.text import TextLayer
 
 
@@ -95,6 +95,19 @@ def test_replace_original_removes_old_searchable_text_preserves_other_content(
     allowed[
         max(0, int(y) - 4) : int(y + h) + 4, max(0, int(x) - 4) : int(x + w) + 4
     ] = True
+    # Rewritten phrases keep their size, so a wider phrase can use nearby blank
+    # paper. Allow its actual new bounds, rather than requiring squeezed letters.
+    with fitz.open(stream=output, filetype="pdf") as doc:
+        for span in doc[0].get_text("dict")["blocks"]:
+            for line in span.get("lines", []):
+                for text in line["spans"]:
+                    if text["text"] == "Changed words":
+                        bounds = fitz.Rect(text["bbox"]) * display_matrix(doc[0])
+                        bounds *= 2
+                        allowed[
+                            max(0, int(bounds.y0) - 4) : int(bounds.y1) + 4,
+                            max(0, int(bounds.x0) - 4) : int(bounds.x1) + 4,
+                        ] = True
     assert changed.any()
     assert not changed[~allowed].any()
 
@@ -142,8 +155,6 @@ def test_unchanged_draft_byte_identical_and_delete_search_text():
     "changes",
     [
         {"id": "p1-b99-l0-s0"},
-        {"text": "long " * 200},
-        {"text": "two\nlines"},
         {"text": "漢"},
     ],
 )
@@ -221,3 +232,128 @@ def test_embedded_font_glyphs_and_original_metadata_survive_color_change():
             font.getGlyphSet()[font.getGlyphOrder()[glyph_id]].draw(pen)
             matched |= pen.value == reference.value
     assert matched
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "DejaVuSans",
+        "DejaVuSerif",
+        "DejaVuSansMono",
+        "LiberationSans-Regular",
+        "LiberationSerif-Regular",
+        "LiberationMono-Regular",
+        "DejaVuSans-Oblique",
+        "DejaVuSerif-Italic",
+        "LiberationSans-Bold",
+        "LiberationMono-BoldItalic",
+    ],
+)
+@pytest.mark.parametrize("size", [24, 40])
+def test_scan_rewrite_recovers_original_font_size_and_baseline(family, size):
+    from src.original import closest_font
+
+    text = "Original typography"
+    font = ImageFont.truetype(str(FONTS / f"{family}.ttf"), size)
+    image = Image.new("L", (650, 100))
+    ImageDraw.Draw(image).text((12, 65), text, font=font, fill=255, anchor="ls")
+    alpha = np.asarray(image) / 255.0
+    matched, points, origin = closest_font(
+        {"text": text, "size": 12, "origin": (0, 0)},
+        alpha,
+        fitz.Rect(0, 0, 325, 50),
+        False,
+    )
+    assert (
+        matched.name.replace(" ", "").lower().startswith(family.split("-")[0].lower())
+    )
+    assert bool(matched.is_bold) == ("Bold" in family)
+    assert bool(matched.is_italic) == ("Italic" in family or "Oblique" in family)
+    assert points == pytest.approx(size / 2, rel=0.055)
+    assert origin.x == pytest.approx(6, abs=0.7)
+    assert origin.y == pytest.approx(32.5, abs=0.7)
+
+
+def test_rewrites_keep_same_size_for_different_phrase_lengths():
+    data = source(True)
+    sizes = []
+    for text in ("New", "Changed words"):
+        output = export_pdf(data, draft(data, text=text))
+        with fitz.open(stream=output, filetype="pdf") as doc:
+            span = doc[0].get_text("dict")["blocks"][-1]["lines"][0]["spans"][0]
+            sizes.append(span["size"])
+            assert span["font"].replace(" ", "").startswith("DejaVuSerif")
+    assert sizes[0] == pytest.approx(16, abs=0.9)
+    assert sizes[1] == pytest.approx(sizes[0], abs=0.01)
+
+
+def test_digital_rewrite_keeps_original_font_size_without_horizontal_squeeze():
+    data = source()
+    output = export_pdf(data, draft(data, text="Original words!"))
+    with fitz.open(stream=output, filetype="pdf") as doc:
+        span = next(
+            s
+            for b in doc[0].get_text("dict")["blocks"]
+            for l in b.get("lines", [])
+            for s in l["spans"]
+            if s["text"] == "Original words!"
+        )
+        assert span["size"] == pytest.approx(18, abs=0.01)
+        assert span["font"] in ("Helvetica", "NimbusSans-Regular")
+        font = fitz.Font(fontname="helv")
+        assert span["bbox"][2] - span["bbox"][0] == pytest.approx(
+            font.text_length("Original words!", fontsize=18), abs=0.1
+        )
+
+
+@pytest.mark.parametrize("scanned", [False, True])
+def test_longer_phrase_uses_free_space_without_shrinking(scanned):
+    data = source(scanned)
+    text = "A considerably longer phrase"
+    output = export_pdf(data, draft(data, text=text))
+    with fitz.open(stream=output, filetype="pdf") as doc:
+        assert len(doc) == 1
+        assert text in doc[0].get_text()
+        span = next(
+            s
+            for b in doc[0].get_text("dict")["blocks"]
+            for l in b.get("lines", [])
+            for s in l["spans"]
+            if s["text"] == text
+        )
+        assert span["size"] == pytest.approx(16 if scanned else 18, abs=0.1)
+    before, after = raster(data), raster(output)
+    assert np.array_equal(before[400:600, 400:600], after[400:600, 400:600])
+
+
+@pytest.mark.parametrize("scanned", [False, True])
+@pytest.mark.parametrize(
+    "text", ["First line\nSecond line", "long " * 200, "abcdefghij" * 100]
+)
+def test_wrapped_text_is_complete_and_original_content_survives(scanned, text):
+    data = source(scanned)
+    output = export_pdf(data, draft(data, text=text))
+    with fitz.open(stream=output, filetype="pdf") as doc:
+        complete = "".join(p.get_text() for p in doc)
+        complete = complete.replace("Other line", "")
+        assert "".join(complete.split()) == "".join(text.split())
+        assert "Original words" not in complete
+        if not scanned:
+            assert "Other line" in doc[0].get_text()
+        spans = [
+            s
+            for p in doc
+            for b in p.get_text("dict")["blocks"]
+            for l in b.get("lines", [])
+            for s in l["spans"]
+            if s["text"] != "Other line"
+        ]
+        assert all(
+            s["size"] == pytest.approx(16 if scanned else 18, abs=0.1) for s in spans
+        )
+        if len(text) > 900:
+            assert len(doc) > 1
+    before, after = raster(data), raster(output)
+    assert np.array_equal(before[400:600, 400:600], after[400:600, 400:600])
+    if not scanned:
+        assert np.array_equal(before[200:245, 75:250], after[200:245, 75:250])
