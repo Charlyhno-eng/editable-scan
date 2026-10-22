@@ -197,3 +197,62 @@ def test_completed_job_keeps_visual_report_after_source_cleanup(monkeypatch):
         assert report["output_bytes"] == len(download.content)
         assert not (app.state.store.root / key / "input").exists()
         assert client.get(f"/api/jobs/{key}").json()["report"] == report
+
+
+def test_editor_draft_export_download_reset_and_expiry():
+    import pymupdf
+
+    from src.editor import EditorDraft, OriginalEdit
+    from tests.test_original import source
+
+    def extracted(data):
+        with pymupdf.open(stream=data, filetype="pdf") as doc:
+            return doc[0].get_text()
+
+    def editable_convert(input, output, progress):
+        output.write_bytes(source())
+        progress(1, 1)
+
+    app = web.create_app(converter=editable_convert)
+    with TestClient(app) as client:
+        key = client.post(
+            "/api/jobs", files={"file": ("scan.png", image_bytes())}
+        ).json()["id"]
+        await_job(client, key)
+        base = f"/api/jobs/{key}"
+        original = client.get(f"{base}/download").content
+        assert client.get(f"{base}/editor").json() == {"edits": []}
+        passage = client.get(f"{base}/passages").json()[0]
+        assert passage["text"] == "Original words"
+        assert client.get(f"{base}/passages?page=50").status_code == 422
+        draft = EditorDraft(
+            edits=[
+                OriginalEdit(id=passage["id"], page=1, text="Edited words", bold=True)
+            ]
+        ).model_dump()
+        assert client.put(f"{base}/editor", json=draft).status_code == 200
+        assert client.get(f"{base}/editor").json() == draft
+        # Export is a read operation on the draft, including during a newer save.
+        assert client.post(f"{base}/export", json={"edits": []}).status_code == 200
+        assert client.get(f"{base}/editor").json() == draft
+        assert client.get(base).json()["edited"] is True
+        output = client.post(f"{base}/export", json=draft)
+        assert output.status_code == 200
+        assert output.headers["content-type"] == "application/pdf"
+        assert extracted(output.content).count("Edited words") == 1
+        assert (
+            extracted(client.get(f"{base}/download").content).count("Edited words") == 1
+        )
+        assert client.get(f"{base}/download?original=true").content == original
+        invalid = {"edits": [{**draft["edits"][0], "page": 50}]}
+        assert client.put(f"{base}/editor", json=invalid).status_code == 422
+        assert client.post(f"{base}/export", json=invalid).status_code == 422
+        assert client.get(f"{base}/editor").json() == draft
+        assert client.put(f"{base}/editor", json={"edits": []}).status_code == 200
+        assert client.get(f"{base}/download").content == original
+        assert client.get(base).json()["edited"] is False
+        app.state.store.jobs[key].finished_at = time.time() - web.JOB_TTL - 1
+        app.state.store.cleanup()
+        assert key not in app.state.store.drafts
+        assert client.get(f"{base}/editor").status_code == 404
+        assert client.post(f"{base}/export", json=draft).status_code == 404

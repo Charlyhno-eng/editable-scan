@@ -80,3 +80,6 @@ footer { display: flex; justify-content: space-between; gap: 20px; padding: 25px
 @keyframes breathe { 50% { opacity: .5; } }
 @media (max-width: 600px) { .app { padding: 0 22px; } header { height: 83px; } .brand { font-size: 18px; } .local-label { font-size: 10px; gap: 7px; } main { padding: 40px 0 55px; } h1 { letter-spacing: -1.7px; } .intro > p { max-width: 270px; margin: 0 auto; font-size: 13px; } .dropzone { padding: 35px 16px 28px; } .formats { font-size: 9px; } .result { padding: 35px 22px; } .compact h1 { font-size: 35px; } footer { font-size: 9px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+.result-actions { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; width: 100%; }
+.result-actions .button { min-width: 180px; }

@@ -18,11 +18,12 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from src.convert import DocumentError, _engine, convert_pdf, inspect_document
+from src.editor import EditError, EditorDraft, export_pdf, validate_draft
 
 log = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -49,6 +50,7 @@ class JobStore:
         self.root = root
         self.converter = converter
         self.jobs: dict[str, Job] = {}
+        self.drafts: dict[str, EditorDraft] = {}
         self.lock = threading.RLock()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="indra")
 
@@ -62,6 +64,7 @@ class JobStore:
             for key in expired:
                 shutil.rmtree(self.root / key, ignore_errors=True)
                 del self.jobs[key]
+                self.drafts.pop(key, None)
 
     def reserve(self, filename: str) -> Job:
         with self.lock:
@@ -82,7 +85,10 @@ class JobStore:
         with self.lock:
             if key not in self.jobs:
                 raise HTTPException(404, "This file has expired or could not be found.")
-            return asdict(self.jobs[key])
+            return {
+                **asdict(self.jobs[key]),
+                "edited": bool(self.drafts.get(key, EditorDraft()).edits),
+            }
 
     def execute(self, key: str):
         folder = self.root / key
@@ -138,7 +144,7 @@ class RequestSizeLimit:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] != "POST":
+        if scope["type"] != "http" or scope["method"] not in ("POST", "PUT"):
             return await self.app(scope, receive, send)
         limit = MAX_UPLOAD_BYTES + 1024 * 1024
         total = 0
@@ -223,7 +229,7 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
         return app.state.store.snapshot(key)
 
     @app.get("/api/jobs/{key}/download")
-    def download(key: str):
+    def download(key: str, original: bool = False):
         store = app.state.store
         job = store.snapshot(key)
         if job["status"] != "done":
@@ -232,15 +238,75 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
             re.sub(r"[\x00-\x1f\x7f]", "", Path(job["filename"]).stem).strip()
             or "document"
         )
-        return FileResponse(
+        response = FileResponse(
             store.root / key / "output.pdf",
             media_type="application/pdf",
             filename=f"{stem}-text.pdf",
             headers={"Cache-Control": "no-store"},
         )
+        with store.lock:
+            draft = store.drafts.get(key)
+        if not original and draft and draft.edits:
+            return Response(
+                export_pdf(editable_path(key).read_bytes(), draft),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": response.headers["content-disposition"],
+                    "Cache-Control": "no-store",
+                },
+            )
+        return response
+
+    def editable_path(key):
+        store = app.state.store
+        with store.lock:
+            job = store.snapshot(key)
+            if job["status"] != "done":
+                raise HTTPException(409, "The PDF is still being prepared.")
+            # Editing renews the existing temporary-document lifetime.
+            store.jobs[key].finished_at = time.time()
+            return store.root / key / "output.pdf"
+
+    @app.get("/api/jobs/{key}/editor")
+    def editor(key: str, response: Response):
+        editable_path(key)
+        response.headers["Cache-Control"] = "no-store"
+        with app.state.store.lock:
+            return app.state.store.drafts.get(key, EditorDraft())
+
+    @app.get("/api/jobs/{key}/passages")
+    def passages(key: str, page: int = 1):
+        from src.original import original_regions
+
+        try:
+            return original_regions(editable_path(key), page)
+        except EditError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.put("/api/jobs/{key}/editor")
+    def save_editor(key: str, draft: EditorDraft):
+        source = editable_path(key)
+        try:
+            validate_draft(source, draft)
+        except EditError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        with app.state.store.lock:
+            app.state.store.drafts[key] = draft
+        return {"saved": True}
+
+    @app.post("/api/jobs/{key}/export")
+    def export(key: str, draft: EditorDraft):
+        source = editable_path(key).read_bytes()
+        try:
+            data = export_pdf(source, draft)
+        except EditError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return Response(
+            data, media_type="application/pdf", headers={"Cache-Control": "no-store"}
+        )
 
     # Keep unknown API routes out of the SPA fallback.
-    @app.api_route("/api/{path:path}", methods=["GET", "POST"])
+    @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT"])
     def missing_api(path: str):
         raise HTTPException(404, "Route not found.")
 
@@ -254,6 +320,10 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
         if (directory / "assets").is_dir():
             app.mount(
                 "/assets", StaticFiles(directory=directory / "assets"), name="assets"
+            )
+        if (directory / "pdfjs").is_dir():
+            app.mount(
+                "/pdfjs", StaticFiles(directory=directory / "pdfjs"), name="pdfjs"
             )
 
         @app.get("/{path:path}")

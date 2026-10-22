@@ -1,8 +1,11 @@
-import { StrictMode, useEffect, useRef, useState } from 'react';
+import { lazy, StrictMode, Suspense, useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Link, Route, Routes, useNavigate, useParams } from 'react-router';
 import logo from '../../assets/editable-scan-logo.png';
+import { errorMessage } from './api';
 import './style.css';
+
+const Editor = lazy(() => import('./Editor'));
 
 type Job = {
   id: string;
@@ -11,6 +14,7 @@ type Job = {
   done: number;
   total: number;
   error: string | null;
+  edited?: boolean;
   report?: {
     similarity_percent: number;
     method: string;
@@ -25,10 +29,10 @@ function fileSize(bytes: number) {
   return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(0)} KB` : `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function QualityReport({ report }: { report: NonNullable<Job['report']> }) {
+function QualityReport({ report, edited }: { report: NonNullable<Job['report']>; edited?: boolean }) {
   return <div className="quality-report">
-    <div className="quality-metrics"><div><strong>{report.similarity_percent.toFixed(1)}%</strong><span>Visual similarity</span></div><div><strong>{fileSize(report.output_bytes)}</strong><span>PDF size</span></div></div>
-    <p className="quality-note">Compared with the source. Similarity measures appearance, not text accuracy.</p>
+    <div className="quality-metrics"><div><strong>{report.similarity_percent.toFixed(1)}%</strong><span>Visual similarity</span></div><div><strong>{fileSize(report.output_bytes)}</strong><span>{edited ? 'PDF size before edits' : 'PDF size'}</span></div></div>
+    <p className="quality-note">{edited ? 'Measured before your text edits. ' : 'Compared with the source. '}Similarity measures appearance, not text accuracy.</p>
     <details><summary>Comparison details</summary>
       <p>Source: {fileSize(report.source_bytes)} · PDF: {fileSize(report.output_bytes)}{report.size_reduction_percent > 0 ? ` · ${report.size_reduction_percent}% smaller` : ''}</p>
       {report.pages.map(page => <p key={page.page}><b>Page {page.page} · {page.similarity_percent.toFixed(1)}%</b><br />{page.summary}</p>)}
@@ -47,15 +51,6 @@ function Icon({ name, className = '' }: { name: 'upload' | 'file' | 'download' |
     text: <path d="M5 5h14M12 5v14m-4 0h8" />,
   };
   return <svg className={className} width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
-}
-
-async function errorMessage(response: Response) {
-  try {
-    const body = await response.json();
-    return typeof body.detail === 'string' ? body.detail : 'The file could not be processed.';
-  } catch {
-    return 'The server is unavailable. Try again shortly.';
-  }
 }
 
 function Upload() {
@@ -148,7 +143,7 @@ function Document() {
       <div className={`result-icon ${done ? 'success' : failed ? 'failure' : 'processing'}`}>{done ? <Icon name="check" /> : failed ? <span>!</span> : <Icon name="text" />}</div>
       <h2>{done ? 'Your PDF is ready' : failed ? 'Conversion interrupted' : job?.status === 'queued' ? 'Waiting in queue…' : job?.done && job.done === job.total ? 'Comparing visual quality…' : 'Recognizing text…'}</h2>
       {job && <p className="filename" title={job.filename}>{job.filename}</p>}
-      {failed ? <><p className="error" role="alert">{error || job?.error}</p>{error && <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}</> : done ? <><p className="result-caption">{job.total} {job.total > 1 ? 'pages' : 'page'} · Selectable text</p><a className="button primary" href={`/api/jobs/${id}/download`} download><Icon name="download" /> Download PDF</a>{job.report && <QualityReport report={job.report} />}</> : <div className="progress-area"><div className={`progress-track ${!job?.done ? 'indeterminate' : ''}`} role="progressbar" aria-label="Pages processed" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job?.done ? progress : undefined}><span style={{ width: `${progress}%` }} /></div><p>{job?.done ? `${job.done} / ${job.total} pages` : 'Preparing document'}</p></div>}
+      {failed ? <><p className="error" role="alert">{error || job?.error}</p>{error && <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>Try again</button>}</> : done ? <><p className="result-caption">{job.total} {job.total > 1 ? 'pages' : 'page'} · Selectable text</p><div className="result-actions"><Link className="button primary" to={`/document/${id}/edit`}><Icon name="text" /> Edit document</Link><a className="button secondary" href={`/api/jobs/${id}/download`} download><Icon name="download" /> Download PDF</a></div>{job.report && <QualityReport report={job.report} edited={job.edited} />}</> : <div className="progress-area"><div className={`progress-track ${!job?.done ? 'indeterminate' : ''}`} role="progressbar" aria-label="Pages processed" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job?.done ? progress : undefined}><span style={{ width: `${progress}%` }} /></div><p>{job?.done ? `${job.done} / ${job.total} pages` : 'Preparing document'}</p></div>}
     </section>
     <Link className="text-link" to="/">{done || failed ? 'Convert another file' : 'Back to home'}</Link>
   </>;
@@ -159,7 +154,7 @@ function NotFound() {
 }
 
 function App() {
-  return <div className="app"><header><Link className="brand" to="/" aria-label="Editable Scan — home"><img className="brand-icon" src={logo} alt="" width="40" height="36" />editable<span className="brand-light">scan</span></Link><span className="local-label"><i /> Local processing</span></header><main><Routes><Route path="/" element={<Upload />} /><Route path="/document/:id" element={<Document />} /><Route path="*" element={<NotFound />} /></Routes></main><footer><span>Figures and layout preserved.</span><span>Editable Scan</span></footer></div>;
+  return <div className="app"><header><Link className="brand" to="/" aria-label="Editable Scan — home"><img className="brand-icon" src={logo} alt="" width="40" height="36" />editable<span className="brand-light">scan</span></Link><span className="local-label"><i /> Local processing</span></header><main><Routes><Route path="/" element={<Upload />} /><Route path="/document/:id" element={<Document />} /><Route path="/document/:id/edit" element={<Suspense fallback={<p>Loading editor…</p>}><Editor /></Suspense>} /><Route path="*" element={<NotFound />} /></Routes></main><footer><span>Figures and layout preserved.</span><span>Editable Scan</span></footer></div>;
 }
 
 createRoot(document.getElementById('root')!).render(<StrictMode><BrowserRouter><App /></BrowserRouter></StrictMode>);

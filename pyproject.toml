@@ -8,6 +8,7 @@ version = "1.0.0"
 description = "Preserve documents and add searchable OCR text."
 readme = "README.md"
 license = "MPL-2.0"
+license-files = ["LICENSE", "LICENSES/*"]
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "fastapi>=0.115",
@@ -16,6 +17,7 @@ dependencies = [
   "opencv-python-headless>=4.10",
   "pikepdf>=10.17",
   "Pillow>=12",
+  "pymupdf>=1.26,<2",
   "pypdfium2>=5",
   "python-multipart>=0.0.20",
   "uvicorn>=0.34",
@@ -25,7 +27,11 @@ dependencies = [
 editable-scan = "src.web:run"
 
 [dependency-groups]
-test = ["fpdf2>=2.8.9", "httpx>=0.28", "pytest>=8"]
+test = [
+    "fpdf2>=2.8.9",
+    "httpx>=0.28",
+    "pytest>=8",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
