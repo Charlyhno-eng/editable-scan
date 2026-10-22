@@ -223,6 +223,55 @@ test('expand a short paragraph to a full line without premature wrapping', async
   expect(result.spans[0].bbox[2]).toBeLessThanOrEqual(460.5);
 });
 
+for (const scanned of [false, true]) {
+  test(`reflow a whole ${scanned ? 'scanned' : 'native'} paragraph when its first line is full`, async ({ page }, testInfo) => {
+    const input = testInfo.outputPath('full-paragraph.pdf');
+    execFileSync(python, ['-c', 'from tests.test_paragraphs import indented_paragraph_source; import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(indented_paragraph_source(sys.argv[2] == "true"))', input, String(scanned)]);
+    await page.goto('/');
+    await page.getByLabel('Choose a document').setInputFiles(input);
+    await page.getByRole('link', { name: 'Edit document' }).click({ timeout: 45_000 });
+    await expect(page.locator('.editor-paper')).toHaveAttribute('data-ready', 'true');
+    const paragraph = page.getByRole('button', { name: /Edit original text: The original paragraph/ });
+    // One target covers both source lines and the space between them.
+    const box = await paragraph.boundingBox();
+    expect(box!.height).toBeGreaterThan(30);
+    await paragraph.click({ position: { x: 8, y: box!.height - 3 } });
+    await expect(page.getByRole('heading', { name: 'Original paragraph' })).toBeVisible();
+    const original = 'The original paragraph already reaches the right edge of its column. Its next line remains in the same paragraph.';
+    await expect(page.getByLabel('Text content')).toHaveValue(original);
+    const replacement = original.replace(' Its next line', ' Newly inserted words move the rest of the paragraph. Its next line');
+    const saved = page.waitForResponse(response => response.url().endsWith('/editor') && response.request().method() === 'PUT');
+    const previewed = page.waitForResponse(response => response.url().endsWith('/export') && response.request().method() === 'POST');
+    await page.getByLabel('Text content').fill(replacement);
+    expect((await saved).status()).toBe(200);
+    expect((await previewed).status()).toBe(200);
+    await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible();
+    await expect(page.getByText('Updating preview…', { exact: true })).toHaveCount(0);
+    await expect(page.locator('.editor-paper')).toHaveAttribute('data-ready', 'true');
+    await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled();
+    await expect.poll(async () => (await paragraph.boundingBox())!.height).toBeGreaterThan(box!.height + 15);
+    const expanded = (await paragraph.boundingBox())!;
+    await paragraph.click({ position: { x: 8, y: expanded.height - 3 } });
+    await expect(page.getByLabel('Text content')).toHaveValue(replacement);
+    if (scanned) await page.screenshot({ path: '/tmp/editable-scan-whole-paragraph.png', fullPage: true });
+    const downloadEvent = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Download PDF' }).click();
+    const output = testInfo.outputPath('reflowed-paragraph.pdf');
+    await (await downloadEvent).saveAs(output);
+    const script = 'import pymupdf,sys,json; d=pymupdf.open(sys.argv[1]); s=[s for b in d[0].get_text("dict")["blocks"] for l in b.get("lines",[]) for s in l["spans"] if not s["text"].startswith("A separate")]; print(json.dumps({"pages":len(d),"spans":s}))';
+    const result = JSON.parse(execFileSync(python, ['-c', script, output], { encoding: 'utf8' }));
+    expect(result.pages).toBe(1);
+    expect(result.spans.length).toBeGreaterThanOrEqual(3);
+    expect(result.spans.map((span: { text: string }) => span.text).join('').replace(/\s/g, '')).toBe(replacement.replace(/\s/g, ''));
+    expect(result.spans[0].origin[0]).toBeCloseTo(64, 0);
+    for (const span of result.spans.slice(1)) expect(span.origin[0]).toBeCloseTo(40, 0);
+    await page.reload();
+    await page.getByRole('button', { name: /Edit original text: The original paragraph/ }).click();
+    await expect(page.getByLabel('Text content')).toHaveValue(replacement);
+    await expect(page.getByLabel('Editing unit')).toHaveValue('paragraph');
+  });
+}
+
 test('save status remains visible while a slower preview is loading', async ({ page }) => {
   await openEditor(page);
   await page.getByRole('button', { name: /Edit original text: Bonjour/ }).click();

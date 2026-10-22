@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import pymupdf as fitz
 
+from src.paragraphs import source_lines
+
 
 def take_line(text, font, size, width):
     """Consume one line, preferring word boundaries and respecting explicit breaks."""
@@ -40,28 +42,10 @@ class PageFlow:
         self.bounds = page.rect
         self.items = items
         self.cleared = []
-        self.rows = []
-        for item in items:
-            rect = fitz.Rect(item["rect"])
-            key = item["id"].rsplit("-s", 1)[0]
-            previous = self.rows[-1] if self.rows else None
-            if (
-                previous
-                and previous["key"] == key
-                and -rect.height * 0.25
-                <= rect.x0 - previous["rect"].x1
-                < max(12, rect.height * 1.8)
-            ):
-                previous["rect"] |= rect
-            else:
-                self.rows.append(
-                    {
-                        "key": key,
-                        "rect": rect,
-                        "baseline": item["origin"][1],
-                        "size": item["size"],
-                    }
-                )
+        self.rows = [
+            {"rect": row["area"], "baseline": row["baseline"], "size": row["metric"]}
+            for row in source_lines(items)
+        ]
         left = min((r["rect"].x0 for r in self.rows), default=2)
         self.margin = (
             max(2, left)
@@ -87,7 +71,16 @@ class PageFlow:
 
     def frame(self, area, origin, size, members):
         """Infer a local text column, not the width of a short source sentence."""
-        reference_size = members[0]["size"] if members else size
+        member_rows = source_lines(members)
+        reference_size = member_rows[0]["metric"] if member_rows else size
+        body_left = origin.x
+        if len(member_rows) > 1:
+            # The first line may be indented (or carry a hanging list marker).
+            # Continuations must start at the body margin, not its first word.
+            body_left += (
+                float(np.median([r["area"].x0 for r in member_rows[1:]]))
+                - member_rows[0]["area"].x0
+            )
         nearby = [
             r
             for r in self.rows
@@ -132,7 +125,7 @@ class PageFlow:
                 b - a for a, b in pairwise(baselines) if size <= b - a <= size * 1.9
             ]
         leading = float(np.median(gaps)) if gaps else size * 1.3
-        return min(right, self.bounds.x1 - 2), leading
+        return min(right, self.bounds.x1 - 2), leading, body_left
 
     @staticmethod
     def erased(rect, cleared):
@@ -161,6 +154,7 @@ class PageFlow:
         origin,
         cleared,
         *,
+        left=None,
         right=None,
         bottom=None,
         leading=None,
@@ -175,6 +169,7 @@ class PageFlow:
             ink[self.pixels(rect)] = True
         result = []
         baseline = origin.y
+        body_left = origin.x if left is None else left
         leading = leading if leading is not None else size * 1.3
         limit_right = min(
             self.bounds.x1 - 2, right if right is not None else self.bounds.x1
@@ -190,7 +185,7 @@ class PageFlow:
             rect = fitz.Rect(item["rect"])
             if (
                 item["origin"][1] > origin.y + size * 0.5
-                and rect.x1 > origin.x
+                and rect.x1 > min(origin.x, body_left)
                 and rect.x0 < limit_right
                 and not self.erased(rect, erased)
             ):
@@ -198,8 +193,9 @@ class PageFlow:
                     limit_bottom, max(origin.y + size * 0.25, rect.y0 - 0.5)
                 )
         while text and baseline + size * 0.25 <= limit_bottom:
+            line_left = origin.x if not result else body_left
             band = fitz.Rect(
-                origin.x,
+                line_left,
                 max(0, baseline - size * 0.85),
                 limit_right,
                 baseline + size * 0.25,
@@ -212,12 +208,12 @@ class PageFlow:
                     available_right,
                     columns.start / self.scale + occupied[0] / self.scale - 1,
                 )
-            line, remaining = take_line(text, font, size, available_right - origin.x)
+            line, remaining = take_line(text, font, size, available_right - line_left)
             if line is not None:
-                position = fitz.Point(origin.x, baseline)
+                position = fitz.Point(line_left, baseline)
                 result.append((position, line))
                 width = font.text_length(line, fontsize=size)
-                area = fitz.Rect(origin.x, band.y0, origin.x + width + 1, band.y1)
+                area = fitz.Rect(line_left, band.y0, line_left + width + 1, band.y1)
                 if reserve:
                     self.reserved.append(area)
                 text = remaining
@@ -235,7 +231,7 @@ class PageFlow:
         area = fitz.Rect(cleared[0])
         for rect in cleared[1:]:
             area |= rect
-        right, leading = self.frame(area, origin, size, members)
+        right, leading, left = self.frame(area, origin, size, members)
         if mode == "shrink":
             for step in range(16):
                 candidate = size * (1 - step / 100)
@@ -245,6 +241,7 @@ class PageFlow:
                     candidate,
                     origin,
                     cleared,
+                    left=left,
                     right=right,
                     bottom=area.y1 + 0.5,
                     leading=leading,
@@ -257,6 +254,7 @@ class PageFlow:
                         candidate,
                         origin,
                         cleared,
+                        left=left,
                         right=right,
                         bottom=area.y1 + 0.5,
                         leading=leading,
@@ -269,6 +267,7 @@ class PageFlow:
             size,
             origin,
             cleared,
+            left=left,
             right=right,
             bottom=area.y1 + 0.5 if mode == "page" else None,
             leading=leading,

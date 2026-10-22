@@ -4,6 +4,7 @@ import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 import worker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { errorMessage } from './api';
+import { paragraphBounds } from './paragraphBounds';
 import './editor.css';
 
 GlobalWorkerOptions.workerSrc = worker;
@@ -17,8 +18,8 @@ type FontInfo = { name: string; size: number; exact: boolean; mixed: boolean; si
 type Passage = Edit & { x: number; y: number; width: number; height: number; originalFont: string; fontExact: boolean; scanned: boolean; memberIds?: string[]; boxes?: { x: number; y: number; width: number; height: number }[]; lineCount?: number };
 type History = { past: Edit[][]; present: Edit[]; future: Edit[][] };
 
-function PagePreview({ pdf, page, zoom, passages, selected, edited, onSelect, onError }: {
-  pdf: PDFDocumentProxy; page: number; zoom: number; passages: Passage[]; selected: string | null; edited: Set<string>;
+function PagePreview({ pdf, page, zoom, passages, selected, edits, onSelect, onError }: {
+  pdf: PDFDocumentProxy; page: number; zoom: number; passages: Passage[]; selected: string | null; edits: Edit[];
   onSelect: (id: string) => void; onError: (error: string) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
@@ -26,6 +27,8 @@ function PagePreview({ pdf, page, zoom, passages, selected, edited, onSelect, on
   const [available, setAvailable] = useState(700);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const [ready, setReady] = useState(false);
+  const [targets, setTargets] = useState(passages);
+  const edited = new Set(edits.map(edit => edit.id));
   const scale = dimensions.width ? Math.min(1.5, available / dimensions.width) * zoom : 1;
   useEffect(() => {
     const observer = new ResizeObserver(entries => setAvailable(Math.max(200, entries[0].contentRect.width - 32)));
@@ -50,26 +53,27 @@ function PagePreview({ pdf, page, zoom, passages, selected, edited, onSelect, on
       element.width = Math.ceil(viewport.width * density);
       element.height = Math.ceil(viewport.height * density);
       render = current.render({ canvas: element, viewport, transform: [density, 0, 0, density, 0, 0] });
-      await render.promise;
+      const [, bounds] = await Promise.all([render.promise, paragraphBounds(current, passages, edits)]);
       if (!cancelled) {
         const target = canvas.current!;
         target.width = element.width; target.height = element.height;
         target.getContext('2d')!.drawImage(element, 0, 0);
+        setTargets(bounds);
         setReady(true);
       }
     }
     void draw().catch(cause => { if (!cancelled && cause?.name !== 'RenderingCancelledException') onError('The PDF preview could not be rendered.'); });
     return () => { cancelled = true; render?.cancel(); };
-  }, [pdf, page, dimensions, scale, onError]);
+  }, [pdf, page, dimensions, scale, passages, edits, onError]);
   return <div className="preview-scroll" ref={host}>
     {!ready && <div className="preview-loading" role="status">Loading page…</div>}
     <div className="editor-paper" data-ready={ready} style={{ width: dimensions.width * scale, height: dimensions.height * scale }} aria-label={`Page ${page} preview`}>
       <canvas ref={canvas} />
       <div className="source-text-layer" aria-label="Original text passages">
-        {passages.flatMap(item => (item.boxes || [item]).map((box, index) => <button key={`${item.id}:${index}`} className={`source-passage ${selected === item.id ? 'selected' : ''} ${edited.has(item.id) ? 'edited' : ''}`}
-          style={{ left: box.x * scale, top: box.y * scale, width: box.width * scale, height: box.height * scale }}
-          aria-label={index === 0 ? `Edit original text: ${item.text}` : `Select paragraph continuation ${index}`}
-          aria-pressed={selected === item.id} onClick={() => onSelect(item.id)} title={item.text} />))}
+        {targets.map(item => <button key={item.id} className={`source-passage ${selected === item.id ? 'selected' : ''} ${edited.has(item.id) ? 'edited' : ''}`}
+          style={{ left: item.x * scale, top: item.y * scale, width: item.width * scale, height: item.height * scale }}
+          aria-label={`Edit original text: ${item.text}`}
+          aria-pressed={selected === item.id} onClick={() => onSelect(item.id)} title={item.text} />)}
       </div>
     </div>
   </div>;
@@ -276,12 +280,12 @@ export default function Editor() {
       </div>
       <div className="editor-layout"><div className="preview-column">
         <div className="page-controls"><button className="tool-button" aria-label="Previous page" disabled={page === 1} onClick={() => setPage(page-1)}>←</button><span>Page {page} / {pageCount}</span><button className="tool-button" aria-label="Next page" disabled={page >= pageCount} onClick={() => setPage(page+1)}>→</button></div>
-        <PagePreview pdf={preview || original!} page={Math.min(page, pageCount)} zoom={zoom} passages={passages} selected={selected} edited={editedIds} onSelect={setSelected} onError={setError} />
+        <PagePreview pdf={preview || original!} page={Math.min(page, pageCount)} zoom={zoom} passages={passages} selected={selected} edits={edits} onSelect={setSelected} onError={setError} />
         <p className="editor-hint" role="status">{previewing ? 'Updating preview…' : `Click an existing ${unit === 'paragraph' ? 'paragraph' : 'line'} to edit its text, font, weight or color.`}</p>
       </div><aside className="text-properties" aria-label="Text properties">
         <label className="field-label editing-unit">Edit as<select aria-label="Editing unit" value={unit} disabled={edits.some(edit => edit.page === page)} onChange={event => { const value = event.target.value as 'paragraph' | 'line'; setUnits(previous => ({ ...previous, [page]: value })); }}><option value="paragraph">Paragraphs</option><option value="line">Individual lines</option></select>{edits.some(edit => edit.page === page) && <span>Restore this page’s edits to change the selection mode.</span>}</label>
-        <div className="properties-title"><h2>{current ? (source?.lineCount && source.lineCount > 1 ? 'Original paragraph' : 'Original text') : 'Select text'}</h2>{current && editedIds.has(current.id) && <button className="tool-button" onClick={() => commit(items => items.filter(item => item.id !== current.id))}>Restore original</button>}</div>
-        {current ? <><label className="field-label">Text<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={source?.lineCount && source.lineCount > 1 ? 8 : 5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} /></label>
+        <div className="properties-title"><h2>{current ? (unit === 'paragraph' ? 'Original paragraph' : 'Original text') : 'Select text'}</h2>{current && editedIds.has(current.id) && <button className="tool-button" onClick={() => commit(items => items.filter(item => item.id !== current.id))}>Restore original</button>}</div>
+        {current ? <><label className="field-label">{unit === 'paragraph' ? 'Paragraph text' : 'Text'}<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={unit === 'paragraph' ? 8 : 5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} />{unit === 'paragraph' && <span>Words flow across the whole paragraph. Original line endings are automatic; use Enter for an explicit break.</span>}</label>
           <label className="field-label overflow-field">When text is longer<select aria-label="Text overflow" value={current.overflow || 'wrap'} onChange={event => patch({ overflow: event.target.value as Overflow })}>
             <option value="wrap">Wrap in free space</option><option value="shrink">Slightly reduce text size</option><option value="page">Continue on a new page</option>
           </select><span>{(current.overflow || 'wrap') === 'wrap' ? 'Keep the original size and wrap within the text column. Stop before existing content; any remaining text continues on an extra page.' : current.overflow === 'shrink' ? 'Use the full column width, then reduce by up to 15% to fit the original height. Any remaining text wraps or continues on an extra page.' : 'Use the full column width at the original size and height. Any text that does not fit continues on an extra page.'}</span></label>

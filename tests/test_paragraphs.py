@@ -54,6 +54,143 @@ def paragraph_source(scanned=False, phrases=None):
     return doc.tobytes()
 
 
+def indented_paragraph_source(scanned=False):
+    """A full first line and a tight OCR box on its indented continuation."""
+    phrases = [
+        "The original paragraph already reaches the right edge of its column.",
+        "Its next line remains in the same paragraph.",
+    ]
+    doc = fitz.open()
+    page = doc.new_page(width=500, height=500)
+    if not scanned:
+        for x, y, text in zip((64, 40), (60, 78), phrases):
+            page.insert_text((x, y), text, fontsize=12)
+        page.insert_text((40, 150), "A separate paragraph stays in place.", fontsize=12)
+        return doc.tobytes()
+
+    image = Image.new("RGB", (1000, 1000), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(str(FONTS / "LiberationSans-Regular.ttf"), 24)
+    for x, y, text in zip((128, 80), (120, 156), phrases):
+        draw.text((x, y), text, font=font, fill="black", anchor="ls")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    page.insert_image(page.rect, stream=buffer.getvalue())
+    with pikepdf.open(io.BytesIO(doc.tobytes())) as pdf:
+        layer = TextLayer(pdf)
+        result = SimpleNamespace(
+            rotation=0,
+            lines=[
+                SimpleNamespace(
+                    text=text,
+                    box=(x, top, x + draw.textlength(text, font=font) / 2, bottom),
+                )
+                for text, x, top, bottom in zip(phrases, (64, 40), (48, 68), (63, 81))
+            ],
+        )
+        _overlay(pdf.pages[0], result, 500, 500, [], layer)
+        layer.finish()
+        buffer = io.BytesIO()
+        pdf.save(buffer)
+        return buffer.getvalue()
+
+
+@pytest.mark.parametrize("scanned", [False, True])
+def test_indented_paragraph_reflows_when_its_first_line_is_full(scanned):
+    data = indented_paragraph_source(scanned)
+    group = original_regions(data, 1, "paragraph")[0]
+    assert group["lineCount"] == 2
+    assert "Its next line" in group["text"]
+    text = group["text"].replace(
+        " Its next line",
+        " Newly inserted words move the rest of the paragraph. Its next line",
+    )
+    edit = OriginalEdit(id=group["id"], page=1, text=text)
+    output = export_pdf(data, EditorDraft(edits=[edit]))
+    with fitz.open(stream=output, filetype="pdf") as edited:
+        assert len(edited) == 1
+        spans = [
+            span
+            for block in edited[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line["spans"]
+            if not span["text"].startswith("A separate")
+        ]
+        assert len(spans) >= 3
+        assert "".join("".join(s["text"] for s in spans).split()) == "".join(
+            text.split()
+        )
+        assert spans[0]["origin"][0] == pytest.approx(64, abs=1)
+        assert all(s["origin"][0] == pytest.approx(40, abs=1) for s in spans[1:])
+        assert all(s["bbox"][2] <= 460.5 for s in spans)
+        assert np.diff([s["origin"][1] for s in spans]) == pytest.approx(18, abs=1)
+
+
+def test_interleaved_columns_are_grouped_by_geometry_instead_of_object_order():
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=500)
+    for x, y, text in (
+        (40, 60, "Left first line"),
+        (340, 60, "Right first line"),
+        (40, 78, "Left second line"),
+        (340, 78, "Right second line"),
+        (40, 96, "Left final line"),
+        (340, 96, "Right final line"),
+    ):
+        page.insert_text((x, y), text, fontsize=12)
+    groups = original_regions(doc.tobytes(), 1, "paragraph")
+    assert [g["text"] for g in groups] == [
+        "Left first line Left second line Left final line",
+        "Right first line Right second line Right final line",
+    ]
+
+
+def test_scan_line_width_does_not_turn_a_short_continuation_into_a_heading():
+    data = paragraph_source(True, ["A paragraph with many ordinary words.", "End."])
+    lines = original_regions(data, 1)
+    assert abs(lines[0]["size"] - lines[1]["size"]) > 5
+    groups = original_regions(data, 1, "paragraph")
+    assert len(groups) == 1
+    assert groups[0]["text"] == "A paragraph with many ordinary words. End."
+
+
+def test_a_bold_line_between_body_rows_prevents_joining_across_it():
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((40, 60), "Body text above the separator", fontsize=12)
+    page.insert_text((40, 72), "A bold separator", fontsize=12, fontname="hebo")
+    page.insert_text((40, 84), "Body text below the separator", fontsize=12)
+    groups = original_regions(doc.tobytes(), 1, "paragraph")
+    assert len(groups) == 3
+
+
+def test_minor_baseline_jitter_does_not_split_inline_fragments():
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((40, 60.2), "Hello ", fontsize=12)
+    x = 40 + fitz.get_text_length("Hello ", fontsize=12)
+    page.insert_text((x, 60), "world", fontname="hebo", fontsize=12)
+    page.insert_text((40, 78), "This remains one paragraph.", fontsize=12)
+    groups = original_regions(doc.tobytes(), 1, "paragraph")
+    assert len(groups) == 1
+    assert groups[0]["lineCount"] == 2
+    assert groups[0]["text"] == "Hello world This remains one paragraph."
+
+
+def test_a_new_first_line_indent_starts_a_separate_paragraph():
+    doc = fitz.open()
+    page = doc.new_page()
+    for x, y, text in (
+        (64, 60, "First paragraph begins here."),
+        (40, 78, "First paragraph continues here."),
+        (64, 96, "Second paragraph begins here."),
+        (40, 114, "Second paragraph continues here."),
+    ):
+        page.insert_text((x, y), text, fontsize=12)
+    groups = original_regions(doc.tobytes(), 1, "paragraph")
+    assert [g["lineCount"] for g in groups] == [2, 2]
+
+
 @pytest.mark.parametrize("scanned", [False, True])
 def test_group_and_replace_complete_paragraph(scanned):
     data = paragraph_source(scanned)
