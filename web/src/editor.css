@@ -69,3 +69,7 @@ main:has(.document-editor) { max-width: 1280px; margin: 0 auto; padding-top: 24p
 .toolbar-label { font-size: 12px; color: #b9c9e3; }
 .text-box-list { max-height: 40svh; overflow-y: auto; }
 .text-box-entry { flex-shrink: 0; }
+.editing-unit { margin-bottom: 22px; }
+.overflow-field, .font-field { margin-top: 18px; }
+.field-label > span { font-size: 10px; line-height: 1.55; color: #8296b4; }
+.text-properties select { width: 100%; min-width: 0; text-overflow: ellipsis; }

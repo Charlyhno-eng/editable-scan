@@ -16,6 +16,9 @@ from src.editor import EditorDraft, OriginalEdit
         {"text": "x\x00y"},
         {"text": "a" * 4001},
         {"x": 30},
+        {"overflow": "clip"},
+        {"font": "../../some-file"},
+        {"font": "UnknownFont"},
     ],
 )
 def test_invalid_edits(changes):

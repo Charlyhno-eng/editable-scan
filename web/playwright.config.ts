@@ -3,6 +3,8 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   timeout: 60_000,
+  // OCR and PDF rendering also run on slower shared CI machines.
+  expect: { timeout: 15_000 },
   fullyParallel: false,
   use: {
     baseURL: 'http://127.0.0.1:8123',

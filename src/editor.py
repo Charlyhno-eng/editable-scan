@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unicodedata
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -17,11 +18,23 @@ class EditError(ValueError):
 
 class OriginalEdit(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: str = Field(pattern=r"^p[0-9]+-b[0-9]+-l[0-9]+-s[0-9]+$", max_length=64)
+    id: str = Field(
+        pattern=r"^p[0-9]+-b[0-9]+-l[0-9]+-s[0-9]+(?:-paragraph)?$", max_length=80
+    )
     page: int = Field(ge=1, le=200, strict=True)
     text: str = Field(max_length=4000)
     bold: bool = False
     color: str = Field(default="#000000", pattern=r"^#[0-9a-fA-F]{6}$")
+    overflow: Literal["wrap", "shrink", "page"] = "wrap"
+    font: Literal[
+        "auto",
+        "DejaVuSans",
+        "DejaVuSerif",
+        "DejaVuSansMono",
+        "LiberationSans",
+        "LiberationSerif",
+        "LiberationMono",
+    ] = "auto"
 
     @field_validator("text")
     @classmethod
@@ -40,11 +53,6 @@ class OriginalEdit(BaseModel):
 class EditorDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     edits: list[OriginalEdit] = Field(default_factory=list, max_length=600)
-
-
-def validate_draft(source, draft):
-    if draft.edits:
-        export_pdf(Path(source).read_bytes(), draft)
 
 
 def export_pdf(source: bytes, draft: EditorDraft) -> bytes:

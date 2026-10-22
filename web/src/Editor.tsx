@@ -7,8 +7,14 @@ import { errorMessage } from './api';
 import './editor.css';
 
 GlobalWorkerOptions.workerSrc = worker;
-type Edit = { id: string; page: number; text: string; bold: boolean; color: string };
-type Passage = Edit & { x: number; y: number; width: number; height: number; font: string; fontExact: boolean; scanned: boolean };
+type Overflow = 'wrap' | 'shrink' | 'page';
+const fonts = [
+  ['LiberationSans', 'Liberation Sans'], ['LiberationSerif', 'Liberation Serif'], ['LiberationMono', 'Liberation Mono'],
+  ['DejaVuSans', 'DejaVu Sans'], ['DejaVuSerif', 'DejaVu Serif'], ['DejaVuSansMono', 'DejaVu Sans Mono'],
+];
+type Edit = { id: string; page: number; text: string; bold: boolean; color: string; overflow?: Overflow; font?: string };
+type FontInfo = { name: string; size: number; exact: boolean; mixed: boolean; similar: string[] };
+type Passage = Edit & { x: number; y: number; width: number; height: number; originalFont: string; fontExact: boolean; scanned: boolean; memberIds?: string[]; boxes?: { x: number; y: number; width: number; height: number }[]; lineCount?: number };
 type History = { past: Edit[][]; present: Edit[]; future: Edit[][] };
 
 function PagePreview({ pdf, page, zoom, passages, selected, edited, onSelect, onError }: {
@@ -60,9 +66,10 @@ function PagePreview({ pdf, page, zoom, passages, selected, edited, onSelect, on
     <div className="editor-paper" data-ready={ready} style={{ width: dimensions.width * scale, height: dimensions.height * scale }} aria-label={`Page ${page} preview`}>
       <canvas ref={canvas} />
       <div className="source-text-layer" aria-label="Original text passages">
-        {passages.map(item => <button key={item.id} className={`source-passage ${selected === item.id ? 'selected' : ''} ${edited.has(item.id) ? 'edited' : ''}`}
-          style={{ left: item.x * scale, top: item.y * scale, width: item.width * scale, height: item.height * scale }}
-          aria-label={`Edit original text: ${item.text}`} aria-pressed={selected === item.id} onClick={() => onSelect(item.id)} title={item.text} />)}
+        {passages.flatMap(item => (item.boxes || [item]).map((box, index) => <button key={`${item.id}:${index}`} className={`source-passage ${selected === item.id ? 'selected' : ''} ${edited.has(item.id) ? 'edited' : ''}`}
+          style={{ left: box.x * scale, top: box.y * scale, width: box.width * scale, height: box.height * scale }}
+          aria-label={index === 0 ? `Edit original text: ${item.text}` : `Select paragraph continuation ${index}`}
+          aria-pressed={selected === item.id} onClick={() => onSelect(item.id)} title={item.text} />))}
       </div>
     </div>
   </div>;
@@ -77,7 +84,12 @@ export default function Editor() {
   const [history, setHistory] = useState<History>({ past: [], present: [], future: [] });
   const [passages, setPassages] = useState<Passage[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [units, setUnits] = useState<Record<number, 'paragraph' | 'line'>>({});
+  const [fontInfo, setFontInfo] = useState<FontInfo | null>(null);
+  const [fontError, setFontError] = useState('');
+  const fontCache = useRef(new Map<string, FontInfo>());
   const [page, setPage] = useState(1);
+  const unit = units[page] || 'paragraph';
   const [zoom, setZoom] = useState(1);
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -89,6 +101,8 @@ export default function Editor() {
   const saved = useRef('');
   const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
   const edits = history.present;
+  const currentEdits = useRef(edits);
+  currentEdits.current = edits;
   const source = passages.find(item => item.id === selected);
   const current = source ? edits.find(item => item.id === source.id) || source : null;
   const json = JSON.stringify({ edits });
@@ -131,13 +145,36 @@ export default function Editor() {
     const controller = new AbortController();
     setLoadingPassages(true); setPassages([]); setSelected(null);
     if (original && page > original.numPages) { setLoadingPassages(false); return; }
-    void fetch(`/api/jobs/${id}/passages?page=${page}`, { signal: controller.signal, cache: 'no-store' }).then(async response => {
+    void fetch(`/api/jobs/${id}/passages?page=${page}&unit=${unit}`, { signal: controller.signal, cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error(await errorMessage(response));
-      const result: Passage[] = await response.json();
-      if (!controller.signal.aborted) { setPassages(result); setLoadingPassages(false); }
+      const result: (Passage & { font: string })[] = await response.json();
+      if (!controller.signal.aborted) {
+        // Old drafts and pages edited as individual fragments must reopen in
+        // that mode, rather than hiding edits inside a newly grouped paragraph.
+        if (unit === 'paragraph' && currentEdits.current.some(edit => edit.page === page && !result.some(item => item.id === edit.id))) {
+          setUnits(previous => ({ ...previous, [page]: 'line' }));
+          return;
+        }
+        setPassages(result.map(item => ({ ...item, originalFont: item.font, font: 'auto', overflow: 'wrap' })));
+        setLoadingPassages(false);
+      }
     }).catch(cause => { if (!controller.signal.aborted) { setError(cause.message); setLoadingPassages(false); } });
     return () => controller.abort();
-  }, [id, loaded, page, original]);
+  }, [id, loaded, page, original, unit]);
+
+  useEffect(() => {
+    setFontInfo(null); setFontError('');
+    if (!selected || !source || source.page !== page) return;
+    const cacheKey = `${id}:${page}:${selected}`;
+    if (fontCache.current.has(cacheKey)) { setFontInfo(fontCache.current.get(cacheKey)!); return; }
+    const controller = new AbortController();
+    void fetch(`/api/jobs/${id}/font?page=${page}&passage=${encodeURIComponent(selected)}`, { signal: controller.signal, cache: 'no-store' }).then(async response => {
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const result: FontInfo = await response.json();
+      if (!controller.signal.aborted) { fontCache.current.set(cacheKey, result); setFontInfo(result); }
+    }).catch(cause => { if (!controller.signal.aborted) setFontError(cause.message); });
+    return () => controller.abort();
+  }, [id, page, selected, source]);
 
   const save = useCallback((body: string) => {
     const request = saveQueue.current.catch(() => {}).then(async () => {
@@ -198,10 +235,10 @@ export default function Editor() {
   }
   function patch(change: Partial<Edit>, editGroup = '') {
     if (!current || !source) return;
-    const next: Edit = { id: source.id, page: source.page, text: current.text, bold: current.bold, color: current.color, ...change };
+    const next: Edit = { id: source.id, page: source.page, text: current.text, bold: current.bold, color: current.color, overflow: current.overflow || 'wrap', font: current.font || 'auto', ...change };
     commit(items => {
       const rest = items.filter(item => item.id !== next.id);
-      return next.text === source.text && next.bold === source.bold && next.color === source.color ? rest : [...rest, next];
+      return next.text === source.text && next.bold === source.bold && next.color === source.color && next.font === 'auto' && next.overflow === 'wrap' ? rest : [...rest, next];
     }, editGroup);
   }
   function undo() { group.current = ''; setHistory(previous => previous.past.length ? { past: previous.past.slice(0, -1), present: previous.past.at(-1)!, future: [previous.present, ...previous.future] } : previous); }
@@ -235,18 +272,25 @@ export default function Editor() {
         <button className="tool-button" aria-label="Undo" disabled={!history.past.length} onClick={undo}>↶</button><button className="tool-button" aria-label="Redo" disabled={!history.future.length} onClick={redo}>↷</button>
         <span className="toolbar-spacer" />
         <label className="zoom-control">Zoom <select aria-label="Zoom" value={zoom} onChange={event => setZoom(Number(event.target.value))}><option value={0.75}>75%</option><option value={1}>Fit</option><option value={1.5}>150%</option><option value={2}>200%</option></select></label>
-        <span className="save-status" role="status">{previewing ? 'Updating preview…' : saveStatus}</span>
+        <span className="save-status" role="status">{saveStatus}</span>
       </div>
       <div className="editor-layout"><div className="preview-column">
         <div className="page-controls"><button className="tool-button" aria-label="Previous page" disabled={page === 1} onClick={() => setPage(page-1)}>←</button><span>Page {page} / {pageCount}</span><button className="tool-button" aria-label="Next page" disabled={page >= pageCount} onClick={() => setPage(page+1)}>→</button></div>
         <PagePreview pdf={preview || original!} page={Math.min(page, pageCount)} zoom={zoom} passages={passages} selected={selected} edited={editedIds} onSelect={setSelected} onError={setError} />
-        <p className="editor-hint">Click an existing line to edit its text, weight or color.</p>
+        <p className="editor-hint" role="status">{previewing ? 'Updating preview…' : `Click an existing ${unit === 'paragraph' ? 'paragraph' : 'line'} to edit its text, font, weight or color.`}</p>
       </div><aside className="text-properties" aria-label="Text properties">
-        <div className="properties-title"><h2>{current ? 'Original text' : 'Select text'}</h2>{current && editedIds.has(current.id) && <button className="tool-button" onClick={() => commit(items => items.filter(item => item.id !== current.id))}>Restore original</button>}</div>
-        {current ? <><label className="field-label">Text<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} /><span>Text keeps its size and wraps into free space. Overflow continues on an extra page.</span></label>
+        <label className="field-label editing-unit">Edit as<select aria-label="Editing unit" value={unit} disabled={edits.some(edit => edit.page === page)} onChange={event => { const value = event.target.value as 'paragraph' | 'line'; setUnits(previous => ({ ...previous, [page]: value })); }}><option value="paragraph">Paragraphs</option><option value="line">Individual lines</option></select>{edits.some(edit => edit.page === page) && <span>Restore this page’s edits to change the selection mode.</span>}</label>
+        <div className="properties-title"><h2>{current ? (source?.lineCount && source.lineCount > 1 ? 'Original paragraph' : 'Original text') : 'Select text'}</h2>{current && editedIds.has(current.id) && <button className="tool-button" onClick={() => commit(items => items.filter(item => item.id !== current.id))}>Restore original</button>}</div>
+        {current ? <><label className="field-label">Text<textarea aria-label="Text content" value={current.text} maxLength={4000} rows={source?.lineCount && source.lineCount > 1 ? 8 : 5} onChange={event => patch({ text: event.target.value }, `${selected}:text`)} onBlur={() => { group.current = ''; }} /></label>
+          <label className="field-label overflow-field">When text is longer<select aria-label="Text overflow" value={current.overflow || 'wrap'} onChange={event => patch({ overflow: event.target.value as Overflow })}>
+            <option value="wrap">Wrap in free space</option><option value="shrink">Slightly reduce text size</option><option value="page">Continue on a new page</option>
+          </select><span>{(current.overflow || 'wrap') === 'wrap' ? 'Keep the original size and wrap within the text column. Stop before existing content; any remaining text continues on an extra page.' : current.overflow === 'shrink' ? 'Use the full column width, then reduce by up to 15% to fit the original height. Any remaining text wraps or continues on an extra page.' : 'Use the full column width at the original size and height. Any text that does not fit continues on an extra page.'}</span></label>
+          <label className="field-label font-field">Font<select aria-label="Text font" value={current.font || 'auto'} onChange={event => patch({ font: event.target.value })}>
+            <option value="auto">{fontInfo ? `Automatic · ${fontInfo.name}` : 'Automatic · matching original…'}</option>{fontInfo ? <><optgroup label="Similar fonts">{fontInfo.similar.map(value => <option key={value} value={value}>{fonts.find(item => item[0] === value)?.[1] || value}</option>)}</optgroup><optgroup label="Other fonts">{fonts.filter(([value]) => !fontInfo.similar.includes(value)).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</optgroup></> : fonts.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select><span>{fontInfo ? `${fontInfo.exact ? 'Original' : 'Estimated'}: ${fontInfo.name} · ${fontInfo.size} pt${fontInfo.mixed ? ' · mixed styles' : ''}` : fontError || 'Matching the original font and size…'}</span></label>
           <div className="format-controls"><button className={`tool-button format-bold ${current.bold ? 'active' : ''}`} aria-label="Bold" aria-pressed={current.bold} onClick={() => patch({ bold: !current.bold })}>B</button><label className="field-label color-field">Color<input type="color" aria-label="Text color" value={current.color} onChange={event => patch({ color: event.target.value }, `${selected}:color`)} /></label></div>
-          <p className="properties-note">{source!.scanned ? 'Bold and color preserve the scanned letter shapes. Rewritten words use an automatically matched font; an exact match cannot be guaranteed from an image.' : `Original font: ${source!.font}. Embedded glyphs are reused when available; unavailable glyphs use a matching fallback.`}</p>
-        </> : <p className="properties-note">{page > original!.numPages ? 'Continuation page. Return to the original page to edit this text.' : loadingPassages ? 'Finding original text…' : passages.length ? 'Choose a line on the page or below.' : 'No editable horizontal text was recognized on this page.'}</p>}
+          <p className="properties-note">{source!.scanned ? 'Bold and color preserve the scanned letter shapes. Rewritten paragraphs use the estimated font or your chosen alternative. An exact font match cannot be guaranteed from an image.' : `Original font: ${source!.originalFont}. Embedded glyphs are reused when available; unavailable glyphs use a matching fallback.`}</p>
+        </> : <p className="properties-note">{page > original!.numPages ? 'Continuation page. Return to the original page to edit this text.' : loadingPassages ? 'Finding original text…' : passages.length ? 'Choose a paragraph on the page or below.' : 'No editable horizontal text was recognized on this page.'}</p>}
         {passages.length > 0 && <div className="text-box-list"><span className="field-label">Original text on this page</span>{passages.map(item => <button key={item.id} className={`text-box-entry ${selected === item.id ? 'active' : ''}`} onClick={() => setSelected(item.id)}>{edits.find(edit => edit.id === item.id)?.text ?? item.text}</button>)}</div>}
       </aside></div>
       <p className="draft-note">Drafts expire after one hour of inactivity. Download your PDF to keep your changes.</p>

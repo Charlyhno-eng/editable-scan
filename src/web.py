@@ -10,11 +10,13 @@ import re
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, UploadFile
@@ -23,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from src.convert import DocumentError, _engine, convert_pdf, inspect_document
-from src.editor import EditError, EditorDraft, export_pdf, validate_draft
+from src.editor import EditError, EditorDraft, export_pdf
 
 log = logging.getLogger(__name__)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -52,10 +54,12 @@ class JobStore:
         self.jobs: dict[str, Job] = {}
         self.drafts: dict[str, EditorDraft] = {}
         self.lock = threading.RLock()
+        self.render_lock = threading.Lock()
+        self.renders = OrderedDict()
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="indra")
 
     def cleanup(self):
-        with self.lock:
+        with self.render_lock, self.lock:
             expired = [
                 key
                 for key, job in self.jobs.items()
@@ -65,6 +69,27 @@ class JobStore:
                 shutil.rmtree(self.root / key, ignore_errors=True)
                 del self.jobs[key]
                 self.drafts.pop(key, None)
+                for cache_key in list(self.renders):
+                    if cache_key[0] == key:
+                        del self.renders[cache_key]
+
+    def render(self, key, draft):
+        # Preview, validation and download share exactly the same PDF. Serialize
+        # cache misses so concurrent preview/save requests only render it once.
+        cache_key = (key, draft.model_dump_json())
+        with self.render_lock:
+            if cache_key in self.renders:
+                self.renders.move_to_end(cache_key)
+                return self.renders[cache_key]
+            data = export_pdf((self.root / key / "output.pdf").read_bytes(), draft)
+            if len(data) <= 32 * 1024 * 1024:
+                self.renders[cache_key] = data
+                while (
+                    len(self.renders) > 8
+                    or sum(map(len, self.renders.values())) > 64 * 1024 * 1024
+                ):
+                    self.renders.popitem(last=False)
+            return data
 
     def reserve(self, filename: str) -> Job:
         with self.lock:
@@ -172,7 +197,7 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
             async def reap():
                 while True:
                     await asyncio.sleep(60)
-                    store.cleanup()
+                    await run_in_threadpool(store.cleanup)
 
             task = asyncio.create_task(reap())
             try:
@@ -194,7 +219,7 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
     @app.post("/api/jobs", status_code=202)
     async def upload(file: UploadFile):
         store = app.state.store
-        store.cleanup()
+        await run_in_threadpool(store.cleanup)
         filename = (file.filename or "document").replace("\\", "/").split("/")[-1][:180]
         job = store.reserve(filename)
         folder = store.root / job.id
@@ -248,7 +273,7 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
             draft = store.drafts.get(key)
         if not original and draft and draft.edits:
             return Response(
-                export_pdf(editable_path(key).read_bytes(), draft),
+                store.render(key, draft),
                 media_type="application/pdf",
                 headers={
                     "Content-Disposition": response.headers["content-disposition"],
@@ -275,19 +300,30 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
             return app.state.store.drafts.get(key, EditorDraft())
 
     @app.get("/api/jobs/{key}/passages")
-    def passages(key: str, page: int = 1):
+    def passages(
+        key: str, page: int = 1, unit: Literal["paragraph", "line"] = "paragraph"
+    ):
         from src.original import original_regions
 
         try:
-            return original_regions(editable_path(key), page)
+            return original_regions(editable_path(key), page, unit)
+        except EditError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/jobs/{key}/font")
+    def font(key: str, passage: str, page: int = 1):
+        from src.original import original_font
+
+        try:
+            return original_font(editable_path(key), page, passage)
         except EditError as exc:
             raise HTTPException(422, str(exc)) from exc
 
     @app.put("/api/jobs/{key}/editor")
     def save_editor(key: str, draft: EditorDraft):
-        source = editable_path(key)
+        editable_path(key)
         try:
-            validate_draft(source, draft)
+            app.state.store.render(key, draft)
         except EditError as exc:
             raise HTTPException(422, str(exc)) from exc
         with app.state.store.lock:
@@ -296,9 +332,9 @@ def create_app(*, converter=convert_pdf, static_dir: Path | None = None):
 
     @app.post("/api/jobs/{key}/export")
     def export(key: str, draft: EditorDraft):
-        source = editable_path(key).read_bytes()
+        editable_path(key)
         try:
-            data = export_pdf(source, draft)
+            data = app.state.store.render(key, draft)
         except EditError as exc:
             raise HTTPException(422, str(exc)) from exc
         return Response(

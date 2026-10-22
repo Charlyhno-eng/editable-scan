@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import threading
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -14,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from src.editor import FONTS, EditError
 from src.flow import PageFlow, continuation_pages
+from src.paragraphs import paragraphs, representative
 
 PDF_LOCK = threading.RLock()
 
@@ -94,7 +97,7 @@ def regions(page):
     return result
 
 
-def original_regions(source, number):
+def original_regions(source, number, unit="line"):
     with (
         PDF_LOCK,
         (
@@ -109,9 +112,13 @@ def original_regions(source, number):
             {
                 k: v
                 for k, v in item.items()
-                if k not in ("rect", "origin", "flags", "positions")
+                if k not in ("rect", "origin", "flags", "positions", "members")
             }
-            for item in regions(doc[number - 1])
+            for item in (
+                paragraphs(regions(doc[number - 1]))
+                if unit == "paragraph"
+                else regions(doc[number - 1])
+            )
         ]
 
 
@@ -180,7 +187,7 @@ def font_candidates():
             yield FONTS / f"{family}{suffix}.ttf"
 
 
-def closest_font(item, alpha, rect, bold):
+def _closest_font(item, alpha, rect, bold):
     """Match original ink without distorting its aspect ratio; recover size/baseline."""
     ys, xs = np.where(alpha > 0.25)
     if not len(xs):
@@ -255,7 +262,107 @@ def closest_font(item, alpha, rect, bold):
     return fitz.Font(fontfile=str(path)), size, origin
 
 
+# Cache only tiny match results, never a user's scanned image. The key includes
+# ink, geometry and style, so two different documents cannot share a stale match.
+_FONT_MATCHES = OrderedDict()
+
+
+def closest_font(item, alpha, rect, bold):
+    key = (
+        hashlib.blake2b(alpha.tobytes(), digest_size=20).digest(),
+        alpha.shape,
+        hashlib.blake2b(item["text"].encode(), digest_size=20).digest(),
+        item["size"],
+        tuple(item["origin"]),
+        tuple(rect),
+        bold,
+    )
+    with PDF_LOCK:
+        if key not in _FONT_MATCHES:
+            _FONT_MATCHES[key] = _closest_font(item, alpha, rect, bold)
+            if len(_FONT_MATCHES) > 64:
+                _FONT_MATCHES.popitem(last=False)
+        _FONT_MATCHES.move_to_end(key)
+        font, size, origin = _FONT_MATCHES[key]
+        return font, size, fitz.Point(origin)
+
+
+def family_font(family, bold, italic):
+    style = (
+        "Italic"
+        if family == "DejaVuSerif" or family.startswith("Liberation")
+        else "Oblique"
+    )
+    suffix = (
+        ("-Bold" if bold else "-") + style
+        if italic
+        else "-Bold"
+        if bold
+        else "-Regular"
+        if family.startswith("Liberation")
+        else ""
+    )
+    return fitz.Font(fontfile=str(FONTS / f"{family}{suffix}.ttf"))
+
+
+def original_font(source, number, passage):
+    """Resolve one selected passage lazily; matching an entire page is wasteful."""
+    with (
+        PDF_LOCK,
+        (
+            fitz.open(stream=source, filetype="pdf")
+            if isinstance(source, bytes)
+            else fitz.open(source)
+        ) as doc,
+    ):
+        if not 1 <= number <= len(doc):
+            raise EditError("This page does not exist.")
+        page = doc[number - 1]
+        items = regions(page)
+        catalog = {item["id"]: item for item in [*items, *paragraphs(items)]}
+        item = catalog.get(passage)
+        if not item:
+            raise EditError("This passage no longer exists. Reopen the editor.")
+        sample = representative(item.get("members", [item]))
+        if sample["scanned"]:
+            rect = fitz.Rect(sample["rect"])
+            rect, _, alpha = patch_image(page, rect + (-1, -1, 1, 1))
+            font, size, _ = closest_font(sample, alpha, rect, False)
+            name = font.name
+        else:
+            name, size = sample["font"], sample["size"]
+        normalized = name.lower()
+        kind = (
+            "Mono"
+            if "mono" in normalized or "courier" in normalized
+            else "Serif"
+            if ("serif" in normalized or "times" in normalized or "roman" in normalized)
+            and "sans" not in normalized
+            else "Sans"
+        )
+        similar = [f"{family}{kind}" for family in ("DejaVu", "Liberation")]
+        if (
+            "liberation" in normalized
+            or "helvetica" in normalized
+            or "times" in normalized
+            or "courier" in normalized
+        ):
+            similar.reverse()
+        return {
+            "name": name,
+            "similar": similar,
+            "size": round(size, 2),
+            "exact": not sample["scanned"],
+            "mixed": len(
+                {(m["font"], round(m["size"], 1)) for m in item.get("members", [item])}
+            )
+            > 1,
+        }
+
+
 def font_for(doc, page, item, edit):
+    if edit.font != "auto":
+        return family_font(edit.font, edit.bold, bool(item["flags"] & 2))
     # Embedded fonts may be subsets. Reuse only if all requested glyphs exist.
     for entry in page.get_fonts(full=True):
         if entry[3].split("+")[-1] == item["font"].split("+")[-1]:
@@ -265,7 +372,7 @@ def font_for(doc, page, item, edit):
                     fitz.Font(fontbuffer=data) if data else fitz.Font(fontname=entry[3])
                 )
                 if (edit.bold or not item["bold"]) and all(
-                    c.isspace() or font.has_glyph(ord(c)) for c in edit.text
+                    c.isspace() or font.has_glyph(ord(c)) for c in set(edit.text)
                 ):
                     return font
             except (ValueError, RuntimeError):
@@ -293,19 +400,7 @@ def font_for(doc, page, item, edit):
         if "courier" in name or "mono" in name
         else "DejaVuSans"
     )
-    italic = bool(item["flags"] & 2)
-    suffix = (
-        ("-BoldItalic" if edit.bold else "-Italic")
-        if italic and (family == "DejaVuSerif" or family.startswith("Liberation"))
-        else ("-BoldOblique" if edit.bold else "-Oblique")
-        if italic
-        else "-Bold"
-        if edit.bold
-        else "-Regular"
-        if family.startswith("Liberation")
-        else ""
-    )
-    return fitz.Font(fontfile=str(FONTS / f"{family}{suffix}.ttf"))
+    return family_font(family, edit.bold, bool(item["flags"] & 2))
 
 
 def edit_original(source, edits):
@@ -323,106 +418,165 @@ def edit_original(source, edits):
             if edit.page > len(doc):
                 raise EditError("This page does not exist.")
             by_page.setdefault(edit.page, []).append(edit)
-        for number, changes in by_page.items():
+        for number, changes in sorted(by_page.items()):
             page = doc[number - 1]
-            catalog = {r["id"]: r for r in regions(page)}
-            rotation = page.rotation
-            page.set_rotation(0)
-            prepared = []
-            flow = None
+            items = regions(page)
+            catalog = {r["id"]: r for r in [*items, *paragraphs(items)]}
+            claimed = set()
+            resolved = []
             for edit in changes:
                 item = catalog.get(edit.id)
                 if not item:
                     raise EditError("This passage no longer exists. Reopen the editor.")
-                if (edit.text, edit.bold, edit.color.lower()) == (
+                members = item.get("members", [item])
+                ids = {m["id"] for m in members}
+                if claimed & ids:
+                    raise EditError(
+                        "A paragraph and its individual lines cannot be edited together."
+                    )
+                claimed |= ids
+                if (edit.text, edit.bold, edit.color.lower(), edit.font) == (
                     item["text"],
                     item["bold"],
                     item["color"],
+                    "auto",
                 ):
                     continue
-                rect = fitz.Rect(item["rect"])
-                if item["scanned"]:
-                    rect = (rect + (-1, -1, 1, 1)) & (page.rect * ~display_matrix(page))
-                    rect, background, alpha = patch_image(page, rect)
+                if edit.text == item["text"] and edit.font == "auto":
+                    # Formatting alone keeps each source fragment's font, size,
+                    # baseline and scanned letter shapes, even in mixed paragraphs.
+                    resolved.extend(
+                        (
+                            edit.model_copy(
+                                update={
+                                    "id": m["id"],
+                                    "text": m["text"],
+                                    "bold": edit.bold
+                                    if edit.bold != item["bold"]
+                                    else m["bold"],
+                                    "color": edit.color
+                                    if edit.color.lower() != item["color"]
+                                    else m["color"],
+                                }
+                            ),
+                            m,
+                            [m],
+                        )
+                        for m in members
+                    )
                 else:
-                    background = alpha = None
-                glyphs = item["scanned"] and edit.text == item["text"]
+                    resolved.append((edit, item, members))
+            if not resolved:
+                continue
+            modified = True
+            rotation = page.rotation
+            page.set_rotation(0)
+            prepared = []
+            flow = None
+            for edit, item, members in sorted(
+                resolved, key=lambda row: (row[1]["rect"][1], row[1]["rect"][0])
+            ):
+                patches = []
+                cleared = []
+                glyphs = (
+                    item["scanned"]
+                    and edit.text == item["text"]
+                    and edit.font == "auto"
+                )
+                for member in members:
+                    rect = fitz.Rect(member["rect"])
+                    if member["scanned"]:
+                        rect = (rect + (-1, -1, 1, 1)) & page.rect
+                        rect, background, alpha = patch_image(page, rect)
+                        patches.append((rect, background, alpha))
+                    cleared.append(rect)
+                sample = representative(members)
                 font = None
-                size, origin = item["size"], fitz.Point(item["origin"])
+                size, origin = sample["size"], fitz.Point(members[0]["origin"])
                 if edit.text and not glyphs:
-                    if item["scanned"]:
-                        font, size, origin = closest_font(item, alpha, rect, edit.bold)
+                    if sample["scanned"]:
+                        rect, _, alpha = patches[members.index(sample)]
+                        font, size, matched_origin = closest_font(
+                            sample, alpha, rect, edit.bold
+                        )
+                        origin = patches[0][0].tl + (matched_origin - rect.tl)
+                        if edit.font != "auto":
+                            font = family_font(
+                                edit.font, edit.bold or font.is_bold, font.is_italic
+                            )
                     else:
-                        font = font_for(doc, page, item, edit)
+                        font = font_for(doc, page, sample, edit)
                 if font and any(
-                    not c.isspace() and not font.has_glyph(ord(c)) for c in edit.text
+                    not c.isspace() and not font.has_glyph(ord(c))
+                    for c in set(edit.text)
                 ):
                     raise EditError(
                         "The matching font does not support one of these characters."
                     )
+                color = tuple(int(edit.color[i : i + 2], 16) / 255 for i in (1, 3, 5))
                 lines = []
-                if font and edit.text:
-                    if not item["scanned"] and edit.text == item["text"]:
-                        lines = (
-                            None  # Preserve exact tracking for formatting-only edits.
-                        )
-                    else:
-                        if flow is None:
-                            flow = PageFlow(page)
-                        lines, overflow = flow.place(
-                            edit.text, font, size, origin, rect
-                        )
-                        if overflow:
-                            color = tuple(
-                                int(edit.color[i : i + 2], 16) / 255 for i in (1, 3, 5)
+                tracking = (
+                    not item["scanned"]
+                    and edit.text == item["text"]
+                    and edit.font == "auto"
+                )
+                if font and edit.text and not tracking:
+                    if flow is None:
+                        flow = PageFlow(page, items)
+                    lines, overflow, size = flow.layout(
+                        edit.text,
+                        font,
+                        size,
+                        origin,
+                        cleared,
+                        edit.overflow,
+                        members=members,
+                    )
+                    if overflow:
+                        pending.append(
+                            (
+                                overflow,
+                                font,
+                                size,
+                                color,
+                                edit.bold,
+                                page.rect.width,
+                                page.rect.height,
                             )
-                            pending.append(
-                                (
-                                    overflow,
-                                    font,
-                                    size,
-                                    color,
-                                    edit.bold,
-                                    page.rect.width,
-                                    page.rect.height,
-                                )
-                            )
+                        )
                 prepared.append(
                     (
                         edit,
                         item,
-                        rect,
-                        background,
-                        alpha,
+                        cleared,
+                        patches,
                         glyphs,
+                        tracking,
                         font,
                         size,
                         origin,
                         lines,
+                        color,
                     )
                 )
-                page.add_redact_annot(rect, fill=False, cross_out=False)
-            if not prepared:
-                page.set_rotation(rotation)
-                continue
-            modified = True
-            # Remove old searchable text. Keep source images and drawings intact;
-            # scanned lettering is replaced by a small local paper patch below.
+            for row in prepared:
+                for rect in row[2]:
+                    page.add_redact_annot(rect, fill=False, cross_out=False)
             page.apply_redactions(images=0, graphics=0, text=0)
             for (
                 edit,
                 item,
-                rect,
-                background,
-                alpha,
+                cleared,
+                patches,
                 glyphs,
+                tracking,
                 font,
                 size,
                 origin,
                 lines,
+                color,
             ) in prepared:
-                color = tuple(int(edit.color[i : i + 2], 16) / 255 for i in (1, 3, 5))
-                if item["scanned"]:
+                for rect, background, alpha in patches:
                     patch = background
                     if glyphs:
                         if edit.bold:
@@ -434,36 +588,43 @@ def edit_original(source, edits):
                             255,
                         ).astype(np.uint8)
                     page.insert_image(rect, stream=png(patch), overlay=True)
-                if edit.text:
-                    if glyphs:
-                        # Scanned glyphs stay visible; replace only their hidden text.
-                        font = fitz.Font(fontfile=str(FONTS / "DejaVuSans.ttf"))
-                        size = rect.height / max(0.1, font.ascender - font.descender)
-                        origin = fitz.Point(rect.x0, rect.y0 + size * font.ascender)
-                    writer = fitz.TextWriter(page.rect)
-                    width = font.text_length(edit.text, fontsize=size)
-                    factor = rect.width / max(0.01, width) if glyphs else 1
-                    if not item["scanned"] and edit.text == item["text"]:
-                        # Preserve the PDF's original tracking and individual origins.
-                        factor = 1
-                        for char, position in zip(edit.text, item["positions"]):
-                            writer.append(position, char, font=font, fontsize=size)
-                    elif glyphs:
-                        writer.append(origin, edit.text, font=font, fontsize=size)
-                    else:
-                        for position, line in lines:
-                            if line:
-                                writer.append(position, line, font=font, fontsize=size)
-                    writer.write_text(
-                        page,
-                        color=color,
-                        render_mode=3
-                        if glyphs
-                        else 2
-                        if edit.bold and not font.is_bold
-                        else 0,
-                        morph=(origin, fitz.Matrix(factor, 1)),
+                if not edit.text:
+                    continue
+                factor = 1
+                if glyphs:
+                    rect = cleared[0]
+                    font = fitz.Font(fontfile=str(FONTS / "DejaVuSans.ttf"))
+                    size = rect.height / max(0.1, font.ascender - font.descender)
+                    origin = fitz.Point(rect.x0, rect.y0 + size * font.ascender)
+                    factor = rect.width / max(
+                        0.01, font.text_length(edit.text, fontsize=size)
                     )
+                writer = fitz.TextWriter(page.rect)
+                if tracking:
+                    for char, position in zip(edit.text, item["positions"]):
+                        writer.append(position, char, font=font, fontsize=size)
+                elif glyphs:
+                    writer.append(origin, edit.text, font=font, fontsize=size)
+                else:
+                    for position, line in lines:
+                        if line:
+                            writer.append(position, line, font=font, fontsize=size)
+                # TextWriter handles crop offsets but omits PDF UserUnit. Scale
+                # its PDF coordinates once, keeping physical sizes and baselines.
+                unit = page.rect.width / page.cropbox.width
+                matrix = fitz.Matrix(
+                    factor / unit, 0, 0, 1 / unit, origin.x * (1 - factor) / unit, 0
+                )
+                writer.write_text(
+                    page,
+                    color=color,
+                    render_mode=3
+                    if glyphs
+                    else 2
+                    if edit.bold and not font.is_bold
+                    else 0,
+                    matrix=matrix if unit != 1 or factor != 1 else None,
+                )
             page.set_rotation(rotation)
         if not modified:
             return source

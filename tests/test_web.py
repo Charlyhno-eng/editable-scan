@@ -256,3 +256,93 @@ def test_editor_draft_export_download_reset_and_expiry():
         assert key not in app.state.store.drafts
         assert client.get(f"{base}/editor").status_code == 404
         assert client.post(f"{base}/export", json=draft).status_code == 404
+
+
+def test_editor_reuses_render_for_preview_save_and_download(monkeypatch):
+    from tests.test_original import source
+
+    calls = []
+    render = web.export_pdf
+
+    def counted(data, draft):
+        calls.append(draft.model_dump_json())
+        return render(data, draft)
+
+    monkeypatch.setattr(web, "export_pdf", counted)
+
+    def convert(input, output, progress):
+        output.write_bytes(source())
+        progress(1, 1)
+
+    app = web.create_app(converter=convert)
+    with TestClient(app) as client:
+        key = client.post(
+            "/api/jobs", files={"file": ("scan.png", image_bytes())}
+        ).json()["id"]
+        await_job(client, key)
+        base = f"/api/jobs/{key}"
+        passage = client.get(f"{base}/passages").json()[0]
+        info = client.get(f"{base}/font", params={"passage": passage["id"], "page": 1})
+        assert info.status_code == 200
+        assert info.json()["name"] == "Helvetica"
+        assert info.json()["exact"] is True
+        assert (
+            client.get(f"{base}/font", params={"passage": "missing"}).status_code == 422
+        )
+        assert client.get(f"{base}/passages?unit=unknown").status_code == 422
+        draft = {
+            "edits": [
+                {
+                    "id": passage["id"],
+                    "page": 1,
+                    "text": "A longer replacement",
+                    "overflow": "shrink",
+                    "font": "LiberationSerif",
+                }
+            ]
+        }
+        preview = client.post(f"{base}/export", json=draft)
+        assert preview.status_code == 200
+        assert client.put(f"{base}/editor", json=draft).status_code == 200
+        assert client.get(f"{base}/download").content == preview.content
+        assert client.post(f"{base}/export", json=draft).content == preview.content
+        assert len(calls) == 1
+        saved = client.get(f"{base}/editor").json()["edits"][0]
+        assert saved["overflow"] == "shrink"
+        assert saved["font"] == "LiberationSerif"
+        assert app.state.store.renders
+        app.state.store.jobs[key].finished_at = time.time() - web.JOB_TTL - 1
+        app.state.store.cleanup()
+        assert not app.state.store.renders
+
+
+def test_concurrent_editor_requests_share_one_render(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.editor import EditorDraft
+    from tests.test_original import draft, source
+
+    data = source()
+    folder = tmp_path / "job"
+    folder.mkdir()
+    (folder / "output.pdf").write_bytes(data)
+    store = web.JobStore(tmp_path, None)
+    calls = []
+    original = web.export_pdf
+
+    def counted(data, edits):
+        calls.append(1)
+        return original(data, edits)
+
+    monkeypatch.setattr(web, "export_pdf", counted)
+    changes = draft(data, text="Concurrent changes")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outputs = list(pool.map(lambda _: store.render("job", changes), range(4)))
+    assert len(calls) == 1
+    assert len(set(outputs)) == 1
+    for i in range(10):
+        store.render("job", draft(data, text=f"Replacement {i}"))
+    assert len(store.renders) == 8
+    store.render("job", EditorDraft())
+    assert len(store.renders) == 8
+    store.pool.shutdown()
